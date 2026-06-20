@@ -21,7 +21,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/protocol/direct"
+	utls "github.com/refraction-networking/utls"
 	"gopkg.in/natefinch/lumberjack.v2"
 
 	_ "net/http/pprof"
@@ -559,5 +561,7 @@ func emptyConfig() (conf *config.Config, err error) {
 }
 
 func init() {
+	utls.SetBufferPool(pool.GetBuffer, pool.PutBuffer)
+	utls.NewBytesBufferFunc = func() utls.BytesBuffer { return pool.NewPooledBuffer() }
 	rootCmd.AddCommand(runCmd)
 }
