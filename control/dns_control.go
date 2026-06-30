@@ -196,14 +196,21 @@ type queryInfo struct {
 	qtype uint16
 }
 
-func (c *DnsController) GetHashKey(qname string, qtype uint16, outbound *outbound.DialerGroup) HashKey {
+func (c *DnsController) GetHashKey(qname string, qtype uint16, outbound *outbound.DialerGroup, dialer *dialer.Dialer) HashKey {
 	// 1. 获取字符串的基础哈希（汇编加速）
 	h1 := maphash.String(c.dnsCacheHashSeed, qname)
 
-	// 2. 混入 qtype 和 outbound 指针
-	// 建议：使用异或配合位移，减少冲突概率
+	// 2. 混入 qtype 和 outbound/dialer/cache-tag
 	h1 ^= uint64(qtype) << 32
 	if outbound != nil {
+		// If the dialer has a dns_cache_tag annotation, use it as the cache domain.
+		// Dialers with the same tag share DNS cache; different tags are isolated.
+		if dialer != nil {
+			if anno := outbound.GetAnnotation(dialer); anno != nil && anno.DnsCacheTag != "" {
+				h1 ^= maphash.String(c.dnsCacheHashSeed, anno.DnsCacheTag)
+				return HashKey(h1)
+			}
+		}
 		h1 ^= uint64(uintptr(unsafe.Pointer(outbound)))
 	}
 	return HashKey(h1)
@@ -327,11 +334,11 @@ func (c *DnsController) handleDNSRequest(
 	req *dnsRequest,
 	queryInfo queryInfo,
 ) error {
-	var err error
-	// Route Requset
-	hashKey := c.GetHashKey(queryInfo.qname, queryInfo.qtype, nil)
+	// Route Request
+	hashKey := c.GetHashKey(queryInfo.qname, queryInfo.qtype, nil, nil)
 	RequestIndex, ok := c.requestSelectCache.Get(hashKey)
 	if !ok {
+		var err error
 		RequestIndex, err = c.routing.RequestSelect(queryInfo.qname, queryInfo.qtype)
 		if err != nil {
 			return err
@@ -344,6 +351,12 @@ func (c *DnsController) handleDNSRequest(
 		return nil
 	}
 
+	// Check for race group: race(upstream1, upstream2, ...)
+	if raceUpstreams := c.routing.GetRaceUpstreams(RequestIndex); len(raceUpstreams) > 0 {
+		return c.handleDNSRequestRace(dnsMessage, req, queryInfo, raceUpstreams)
+	}
+
+	// Resolve the single upstream and dial.
 	var upstream *dns.Upstream
 	if RequestIndex == consts.DnsRequestOutboundIndex_AsIs {
 		// As-is should not be valid in response routing, thus using connection realDest is reasonable.
@@ -356,13 +369,28 @@ func (c *DnsController) handleDNSRequest(
 		}
 	} else {
 		// Get corresponding upstream.
+		var err error
 		upstream, err = c.routing.GetUpstream(RequestIndex)
 		if err != nil {
 			return err
 		}
 	}
 
-	// Dial and re-route
+	return c.handleDNSRequestByUpstream(dnsMessage, req, queryInfo, upstream)
+}
+
+// handleDNSRequestByUpstream selects the best dialer, sends DNS query, handles response
+// routing, logging, and lookup cache update. It manages dialArgument lifecycle internally.
+// The dnsMessage is modified in-place by dialSend and response routing.
+func (c *DnsController) handleDNSRequestByUpstream(
+	dnsMessage *dnsmessage.Msg,
+	req *dnsRequest,
+	queryInfo queryInfo,
+	upstream *dns.Upstream,
+) error {
+	dialArgument := dialArgumentPool.Get().(*dialArgument)
+	defer dialArgumentPool.Put(dialArgument)
+
 	var isNew bool
 	var reqMsg *dnsmessage.Msg
 	if !c.routing.HasResponseRules() {
@@ -370,8 +398,8 @@ func (c *DnsController) handleDNSRequest(
 	} else {
 		reqMsg = dnsMessage.Copy()
 	}
-	dialArgument := dialArgumentPool.Get().(*dialArgument)
-	defer dialArgumentPool.Put(dialArgument)
+
+	var err error
 Dial:
 	for invokingDepth := 1; invokingDepth <= MaxDnsLookupDepth; invokingDepth++ {
 		if log.IsLevelEnabled(log.DebugLevel) {
@@ -381,12 +409,10 @@ Dial:
 			}).Debugln("Request to DNS upstream")
 		}
 
-		// Select best dial arguments (outbound, dialer, l4proto, ipversion, etc.)
-		if err := c.bestDialerChooser(req, upstream, dialArgument); err != nil {
+		// Select best dial arguments and send DNS query.
+		if err = c.bestDialerChooser(req, upstream, dialArgument); err != nil {
 			return err
 		}
-
-		// TODO: 这里可能不可以这样做
 		isNew, err = c.dialSend(dnsMessage, upstream, dialArgument, queryInfo)
 		if err != nil {
 			isNetError, isClosed, isTimeout, isTemporary := GetNetErrorInfo(err)
@@ -416,7 +442,6 @@ Dial:
 				}
 			}
 		}
-
 		// Route response.
 		ResponseIndex, nextUpstream, err := c.routing.ResponseSelect(dnsMessage, upstream)
 		if err != nil {
@@ -426,12 +451,9 @@ Dial:
 			c.logDnsResponse(req, dialArgument, queryInfo, ResponseIndex == consts.DnsResponseOutboundIndex_Accept)
 			switch ResponseIndex {
 			case consts.DnsResponseOutboundIndex_Reject:
-				// Reject
-				// TODO: cache response reject.
 				c.reject(dnsMessage)
 				fallthrough
 			case consts.DnsResponseOutboundIndex_Accept:
-				// Accept.
 				break Dial
 			default:
 				return common.Errf("unknown upstream: %v", ResponseIndex.String())
@@ -450,6 +472,8 @@ Dial:
 		upstream = nextUpstream
 		reqMsg.CopyTo(dnsMessage)
 	}
+
+	// Update lookup cache.
 	switch {
 	case !dnsMessage.Response,
 		len(dnsMessage.Answer) == 0,
@@ -475,6 +499,51 @@ Dial:
 			return c.updateLookupCache(queryInfo.qname, domainBitmap, allZero, ips, time.Duration(ttl)*time.Second)
 		}
 	}
+	return nil
+}
+
+// handleDNSRequestRace sends DNS queries to multiple upstreams concurrently and uses the
+// first successful response. Each sub-upstream independently goes through the full
+// handleDNSRequestByUpstream path (including response routing).
+func (c *DnsController) handleDNSRequestRace(
+	dnsMessage *dnsmessage.Msg,
+	req *dnsRequest,
+	queryInfo queryInfo,
+	raceUpstreams []*dns.Upstream,
+) error {
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var winnerMsg *dnsmessage.Msg
+	var firstErr error
+
+	for _, upstream := range raceUpstreams {
+		wg.Add(1)
+		go func(upstream *dns.Upstream, msg *dnsmessage.Msg) {
+			defer wg.Done()
+
+			err := c.handleDNSRequestByUpstream(msg, req, queryInfo, upstream)
+
+			mu.Lock()
+			if err == nil && winnerMsg == nil && msg.Response && len(msg.Answer) > 0 {
+				winnerMsg = msg
+			}
+			if err != nil && firstErr == nil {
+				firstErr = err
+			}
+			mu.Unlock()
+		}(upstream, dnsMessage.Copy())
+	}
+	wg.Wait()
+
+	if winnerMsg == nil {
+		if firstErr != nil {
+			return fmt.Errorf("all %d race upstreams failed: %w", len(raceUpstreams), firstErr)
+		}
+		return fmt.Errorf("all %d race upstreams failed", len(raceUpstreams))
+	}
+
+	// Copy the winner's response back to the original message.
+	winnerMsg.CopyTo(dnsMessage)
 	return nil
 }
 
@@ -636,7 +705,7 @@ func recycleDnsRefreshParam(p *dnsRefreshParam) {
 func (c *DnsController) dialSend(msg *dnsmessage.Msg, upstream *dns.Upstream, dialArg *dialArgument, queryInfo queryInfo) (bool, error) {
 	// Lookup Cache
 	if c.enableCache {
-		if rr, fetchedAt, isNew := c.dnsCache.Get(c.GetHashKey(queryInfo.qname, queryInfo.qtype, dialArg.Outbound)); rr != nil {
+		if rr, fetchedAt, isNew := c.dnsCache.Get(c.GetHashKey(queryInfo.qname, queryInfo.qtype, dialArg.Outbound, dialArg.Dialer)); rr != nil {
 			originalMsgForExpiredFetch := FillMsgByCache(msg, rr, fetchedAt)
 			if originalMsgForExpiredFetch != nil {
 				// Refresh cache asynchronously.
@@ -675,7 +744,7 @@ func (c *DnsController) dialSend(msg *dnsmessage.Msg, upstream *dns.Upstream, di
 
 func (c *DnsController) singleFlightForwardDNS(
 	qi queryInfo, msg *dnsmessage.Msg, upstream *dns.Upstream, dialArgument *dialArgument) (*dnsmessage.Msg, error) {
-	hashKey := c.GetHashKey(qi.qname, qi.qtype, dialArgument.Outbound)
+	hashKey := c.GetHashKey(qi.qname, qi.qtype, dialArgument.Outbound, dialArgument.Dialer)
 	param := singleFlightParam{
 		dnsForwarderKey: dnsForwarderKey{upstream: *upstream, dialArgument: *dialArgument},
 		c:               c,
@@ -741,7 +810,7 @@ func (c *DnsController) singleFlightForwardDNS(
 					"outbound": dialArgument.Outbound,
 				}).Debugf("Update DNS record cache")
 			}
-			key := c.GetHashKey(qname, qtype, dialArgument.Outbound)
+			key := c.GetHashKey(qname, qtype, dialArgument.Outbound, dialArgument.Dialer)
 			fixedTtl := c.fixedDomainTtl[qname]
 			c.dnsCache.Save(key, msg.Answer, fixedTtl)
 		}

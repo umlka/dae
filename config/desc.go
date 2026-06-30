@@ -66,8 +66,9 @@ var DnsDesc = Desc{
 	"fixed_domain_ttl": "Give a fixed ttl for domains. Zero means that dae will request to upstream every time and not cache DNS results for these domains.",
 	"upstream":         "Value can be scheme://host:port, where the scheme can be tcp/udp/tcp+udp.\nIf host is a domain and has both IPv4 and IPv6 record, dae will automatically choose IPv4 or IPv6 to use according to group policy (such as min latency policy).\nPlease make sure DNS traffic will go through and be forwarded by dae, which is REQUIRED for domain routing.\nIf dial_mode is \"ip\", the upstream DNS answer SHOULD NOT be polluted, so domestic public DNS is not recommended.",
 	"request": `DNS requests will follow this routing.
-Built-in outbound: asis.
-Available functions: qname, qtype`,
+Built-in outbound: asis, reject.
+Available functions: qname, qtype, static.
+Special outbound: race(upstream1, upstream2, ...) races multiple upstreams concurrently and uses the first response.`,
 	"response": `DNS responses will follow this routing.
 Built-in outbound: accept, reject.
 Available functions: qname, qtype, ip, upstream`,
@@ -77,7 +78,10 @@ var GroupDesc = Desc{
 	"filter": `Filter nodes from the global node pool defined by the "subscription" and "node" sections.
 Available functions: name, subtag. Not operator is supported.
 Available keys in name function: keyword, regex. No key indicates full match.
-Available keys in subtag function: regex. No key indicates full match.`,
+Available keys in subtag function: regex. No key indicates full match.
+Available annotations: priority, add_latency, dns_cache_tag.
+dns_cache_tag: Group dialers sharing the same DNS cache domain. Dialers with the same non-empty tag share DNS cache entries (useful when multiple dialers are on the same VPS in the same region), while dialers with different tags are isolated. When empty, falls back to per-group caching. Syntax: [dns_cache_tag: 'my_region']
+`,
 	"policy": `Dialer selection policy. For each new connection, select a node as dialer from group by this policy.
 Available values: random, fixed, min, min_avg10, min_moving_avg.
 random: Select randomly.
