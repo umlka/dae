@@ -16,8 +16,6 @@
 #include "headers/bpf_core_read.h"
 #include "headers/bpf_endian.h"
 #include "headers/bpf_helpers.h"
-#include "headers/bpf_timer.h"
-
 // #define __DEBUG_ROUTING
 // #define __PRINT_ROUTING_RESULT
 // #define __PRINT_SETUP_PROCESS_CONNNECTION
@@ -52,7 +50,6 @@
 #define MAX_LPM_SIZE 2048000
 #define MAX_LPM_NUM (MAX_MATCH_SET_LEN + 8)
 #define MAX_DST_MAPPING_NUM 65536
-#define MAX_DST_MAPPING_NUM_UDP (65536 * 2)
 #define MAX_COOKIE_PID_PNAME_MAPPING_NUM 65536
 #define MAX_DOMAIN_ROUTING_NUM 65536
 #define MAX_ARG_LEN 128
@@ -71,8 +68,6 @@
 #define OUTBOUND_LOGICAL_MASK 0xFE
 
 #define TPROXY_MARK 0x8000000
-
-#define TIMEOUT_UDP_CONN_STATE 3e11 /* 300s */
 
 #define NDP_REDIRECT 137
 
@@ -389,24 +384,6 @@ struct {
 	__uint(pinning, LIBBPF_PIN_NONE);
 } cookie_pid_map SEC(".maps");
 // Memory is allocated on demand (BPF_F_NO_PREALLOC).
-
-struct udp_conn_state {
-	// For each flow (echo symmetric path), note the original flow direction.
-	// Mark as true if traffic go through wan ingress.
-	// For traffic from lan that go through wan ingress, dae parse them in lan egress
-	bool is_wan_ingress_direction;
-
-	struct bpf_timer timer;
-};
-
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
-	__uint(max_entries, MAX_DST_MAPPING_NUM_UDP);
-	__type(key, struct tuples_key);
-	__type(value, struct udp_conn_state);
-} udp_conn_state_map SEC(".maps");
-// 16.78 MB
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -1728,14 +1705,6 @@ static __noinline int prep_redirect_to_control_plane(
 						 from_wan);
 }
 
-static int refresh_udp_conn_state_timer_cb(void *_udp_conn_state_map,
-					   struct tuples_key *key,
-					   struct udp_conn_state *val)
-{
-	bpf_map_delete_elem(&udp_conn_state_map, key);
-	return 0;
-}
-
 static __always_inline void copy_reversed_tuples(struct tuples_key *key,
 						 struct tuples_key *dst)
 {
@@ -1747,34 +1716,6 @@ static __always_inline void copy_reversed_tuples(struct tuples_key *key,
 	dst->l4proto = key->l4proto;
 }
 
-static __always_inline struct udp_conn_state *
-refresh_udp_conn_state_timer(struct tuples_key *key, bool is_wan_ingress_direction)
-{
-	struct udp_conn_state *state = bpf_map_lookup_elem(&udp_conn_state_map, key);
-
-	if (state)
-		goto rearm;
-
-	struct udp_conn_state new_state = {};
-
-	new_state.is_wan_ingress_direction = is_wan_ingress_direction;
-	if (unlikely(bpf_map_update_elem(&udp_conn_state_map, key, &new_state, BPF_NOEXIST)))
-		return NULL;
-
-	state = bpf_map_lookup_elem(&udp_conn_state_map, key);
-	if (unlikely(!state))
-		return NULL;
-
-	bpf_timer_init(&state->timer, &udp_conn_state_map, CLOCK_MONOTONIC);
-	bpf_timer_set_callback(&state->timer, refresh_udp_conn_state_timer_cb);
-
-rearm:
-	bpf_timer_start(&state->timer, TIMEOUT_UDP_CONN_STATE, 0);
-	return state;
-}
-
-// Cookie will change after the first packet, so we just use it for
-// handshake.
 static __always_inline bool pid_is_control_plane(struct __sk_buff *skb,
 						 struct pid_pname **p)
 {
@@ -1805,6 +1746,39 @@ static __always_inline bool pid_is_control_plane(struct __sk_buff *skb,
 	if ((skb->mark & 0x100) == 0x100)
 		return true;
 	return false;
+}
+
+long control_plane_save_udp_traffic(struct tuples_key* key, struct routing_result *routing_result)
+{
+	__builtin_memset(&key->dip, 0, sizeof(key->dip));
+	key->dport = 0;
+	struct routing_result *existing = bpf_map_lookup_elem(&routing_tuples_map, key);
+	if (existing) {
+		existing->last_seen_ns = routing_result->last_seen_ns;
+		return 0;
+	}
+	return bpf_map_update_elem(&routing_tuples_map, key, routing_result, BPF_ANY);
+}
+
+// Returns 0 to continue, 1 for direct, 2 for block.
+u32 check_connectivity_map(struct routing_result *routing_result, struct __sk_buff *skb, u8 l4proto) {
+	if (routing_result->outbound >= OUTBOUND_MUST_RULES)
+		return 0;
+	struct outbound_connectivity_query q = {
+		.outbound = routing_result->outbound,
+		.ipversion = skb->protocol == bpf_htons(ETH_P_IP) ? 4 : 6,
+		.l4proto = l4proto
+	};
+	
+#if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
+		bpf_printk("outbound_connectivity_query: outbound: %u, ipversion: %u, l4proto: %u", q.outbound, q.ipversion, q.l4proto);
+#endif
+
+	__u32 *alive = bpf_map_lookup_elem(&outbound_connectivity_map, &q);
+	if (!alive) {
+		return 1;
+	}
+	return *alive;
 }
 
 // Routing and redirect the packet back.
@@ -1858,17 +1832,10 @@ static __always_inline int do_tproxy(struct __sk_buff *skb, bool is_wan, u32 lin
 
 	bool isdns = tuples.five.dport == bpf_htons(53) && (l4proto == IPPROTO_UDP || l4proto == IPPROTO_TCP);
 
-	struct tuples_key routing_tuples_key = tuples.five;
-	if (l4proto == IPPROTO_UDP) {
-		__builtin_memset(&routing_tuples_key.dip, 0, sizeof(routing_tuples_key.dip));
-		routing_tuples_key.dport = 0;
-	}
-
 	if (l4proto == IPPROTO_TCP && !(tcph.syn && !tcph.ack)) {
 		// Established TCP Connection.
 		struct routing_result *routing_result =
-			bpf_map_lookup_elem(&routing_tuples_map,
-					    &routing_tuples_key);
+			bpf_map_lookup_elem(&routing_tuples_map, &tuples.five);
 
 		if (routing_result) {
 			routing_result->last_seen_ns = bpf_ktime_get_ns();
@@ -1879,6 +1846,42 @@ static __always_inline int do_tproxy(struct __sk_buff *skb, bool is_wan, u32 lin
 
 		// Non-proxy connections or previous connections.
 		return TC_ACT_PIPE;
+	}
+
+	struct tuples_key udp_tuples_key;
+	if (l4proto == IPPROTO_UDP) {
+		udp_tuples_key = tuples.five;
+		// Fast-path: per-flow full-5-tuple lookup. For DNS, zero
+		// sport so all queries from the same IP share one entry.
+		// Note: this assumes the rules configuration never uses
+		// sport to differentiate routing for UDP 53.
+		if (isdns)
+			udp_tuples_key.sport = 0;
+		struct routing_result *routing_result =
+			bpf_map_lookup_elem(&routing_tuples_map, &udp_tuples_key);
+		if (routing_result) {
+			routing_result->last_seen_ns = bpf_ktime_get_ns();
+			switch (routing_result->outbound) {
+			case OUTBOUND_DIRECT:
+				goto direct;
+			case OUTBOUND_BLOCK:
+				goto block;
+			default:
+				// Check connectivity — redirect based on alive state.
+				if (!isdns) {
+					switch (check_connectivity_map(routing_result, skb, l4proto)) {
+					case 1:
+						goto direct;
+					case 2:
+						goto block;
+					}
+				}
+				if (control_plane_save_udp_traffic(&udp_tuples_key, routing_result)) {
+					goto block;
+				}
+				goto control_plane;
+			}
+		}
 	}
 
 	// New Connection.
@@ -1940,6 +1943,11 @@ static __always_inline int do_tproxy(struct __sk_buff *skb, bool is_wan, u32 lin
 			 sizeof(routing_result.mac));
 	routing_result.last_seen_ns = bpf_ktime_get_ns();
 
+	if (l4proto == IPPROTO_UDP) {
+		bpf_map_update_elem(&routing_tuples_map, &udp_tuples_key,
+					&routing_result, BPF_ANY);
+	}
+
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 	if (is_wan) {
 		if (l4proto == IPPROTO_TCP) {
@@ -1970,14 +1978,6 @@ static __always_inline int do_tproxy(struct __sk_buff *skb, bool is_wan, u32 lin
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 		bpf_printk("GO OUTBOUND_DIRECT");
 #endif
-		if (l4proto == IPPROTO_UDP) {
-			struct udp_conn_state *conn_state =
-				refresh_udp_conn_state_timer(&tuples.five, false);
-			if (!conn_state)
-				return TC_ACT_SHOT;
-			if (conn_state->is_wan_ingress_direction)
-				return TC_ACT_PIPE;
-		}
 		goto direct;
 	case OUTBOUND_BLOCK:
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
@@ -1986,26 +1986,10 @@ static __always_inline int do_tproxy(struct __sk_buff *skb, bool is_wan, u32 lin
 		goto block;
 	}
 
-	if (!isdns && routing_result.outbound < OUTBOUND_MUST_RULES) {
-		// Check outbound connectivity in specific ipversion and l4proto.
-		struct outbound_connectivity_query q = {
-			.outbound = routing_result.outbound,
-			.ipversion = skb->protocol == bpf_htons(ETH_P_IP) ? 4 : 6,
-			.l4proto = l4proto
-		};
+	if (!isdns) {
+		// Check connectivity — redirect based on alive state.
 
-#if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
-		bpf_printk("outbound_connectivity_query: outbound: %u, ipversion: %u, l4proto: %u", q.outbound, q.ipversion, q.l4proto);
-#endif
-
-		__u32 *alive = bpf_map_lookup_elem(&outbound_connectivity_map, &q);
-
-		if (!alive) {
-			// Outbound is not ready. skip
-			return TC_ACT_PIPE;
-		}
-
-		switch (*alive) {
+		switch (check_connectivity_map(&routing_result, skb, l4proto)) {
 		case 1:
 			goto direct;
 		case 2:
@@ -2014,8 +1998,13 @@ static __always_inline int do_tproxy(struct __sk_buff *skb, bool is_wan, u32 lin
 	}
 
 	// Only proxy traffic should be saved.
-	if (bpf_map_update_elem(&routing_tuples_map, &routing_tuples_key,
-				&routing_result, BPF_ANY)) {
+	long ret;
+	if (l4proto == IPPROTO_UDP) {
+		ret = control_plane_save_udp_traffic(&udp_tuples_key, &routing_result);
+	} else {
+		ret = bpf_map_update_elem(&routing_tuples_map, &tuples.five, &routing_result, BPF_ANY);
+	}
+	if (ret) {
 		bpf_printk("shot save routing result: %d", s64_ret);
 		return TC_ACT_SHOT;
 	}
@@ -2058,28 +2047,6 @@ static __always_inline int do_lan_egress(struct __sk_buff *skb, u32 link_h_len)
 		ctx->l4proto == IPPROTO_ICMPV6 && ctx->icmp6h.icmp6_type == NDP_REDIRECT) {
 		// REDIRECT (NDP)
 		return TC_ACT_SHOT;
-	}
-
-	// Update Conntrack (TCP and UDP)
-	if (ctx->l4proto == IPPROTO_TCP) {
-		struct tuples tuples;
-		struct tuples_key reversed_tuples_key;
-
-		get_tuples(skb, &tuples, &ctx->iph, &ctx->ipv6h, &ctx->tcph, &ctx->udph, ctx->l4proto);
-		copy_reversed_tuples(&tuples.five, &reversed_tuples_key);
-		// Reverse-side TCP packets refresh the forward conn-state.
-	} else if (ctx->l4proto == IPPROTO_UDP) {
-		if (ctx->udph.source == bpf_htons(53) || ctx->udph.dest == bpf_htons(53))
-			return TC_ACT_PIPE;
-
-		struct tuples tuples;
-		struct tuples_key reversed_tuples_key;
-
-		get_tuples(skb, &tuples, &ctx->iph, &ctx->ipv6h, &ctx->tcph, &ctx->udph, ctx->l4proto);
-		copy_reversed_tuples(&tuples.five, &reversed_tuples_key);
-
-		if (!refresh_udp_conn_state_timer(&reversed_tuples_key, true))
-			return TC_ACT_SHOT;
 	}
 
 	return TC_ACT_PIPE;
@@ -2126,27 +2093,6 @@ static __always_inline int do_tproxy_wan_ingress(struct __sk_buff *skb, u32 link
 			return TC_ACT_SHOT;
 		}
 		return TC_ACT_OK;
-	}
-
-	// Update Conntrack (TCP and UDP)
-	if (ctx->l4proto == IPPROTO_TCP) {
-		struct tuples tuples;
-		struct tuples_key reversed_tuples_key;
-
-		get_tuples(skb, &tuples, &ctx->iph, &ctx->ipv6h, &ctx->tcph, &ctx->udph, ctx->l4proto);
-		copy_reversed_tuples(&tuples.five, &reversed_tuples_key);
-	} else if (ctx->l4proto == IPPROTO_UDP) {
-		if (ctx->udph.source == bpf_htons(53) || ctx->udph.dest == bpf_htons(53))
-			return TC_ACT_PIPE;
-
-		struct tuples tuples;
-		struct tuples_key reversed_tuples_key;
-
-		get_tuples(skb, &tuples, &ctx->iph, &ctx->ipv6h, &ctx->tcph, &ctx->udph, ctx->l4proto);
-		copy_reversed_tuples(&tuples.five, &reversed_tuples_key);
-
-		if (!refresh_udp_conn_state_timer(&reversed_tuples_key, true))
-			return TC_ACT_SHOT;
 	}
 
 	return TC_ACT_PIPE;
