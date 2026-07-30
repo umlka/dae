@@ -67,6 +67,7 @@ type DnsControllerOption struct {
 
 type coreIpDomainCacheValue struct {
 	qHash  HashKey
+	qname  string
 	ip     netip.Addr
 	bitmap *[32]uint32
 }
@@ -135,7 +136,7 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		requestSelectCache: common.NewTimeWheelCache[HashKey, consts.DnsRequestOutboundIndex](1*time.Hour, 5*time.Second, nil),
 		lookupCache:        make(map[HashKey]uint16),
 	}
-	c.coreIpDomainCache = common.NewTimeWheelCache[HashKey, coreIpDomainCacheValue](
+	c.coreIpDomainCache = common.NewTimeWheelCache(
 		1*time.Hour, 5*time.Second, func(_ HashKey, v coreIpDomainCacheValue, replaced bool) {
 			if !replaced {
 				c.recycleLookupCache(v.qHash, v.ip, v.bitmap)
@@ -608,7 +609,7 @@ func (c *DnsController) updateLookupCache(qname string, domainBitmap []uint32, a
 		hashKey := QnameIpHash(qHash, ip)
 		if _, ok := c.coreIpDomainCache.Get(hashKey); ok {
 			// Just update ttl, no need to update ebpf map.
-			c.coreIpDomainCache.SaveWithTTL(hashKey, coreIpDomainCacheValue{qHash: qHash, ip: ip, bitmap: bitmap}, lookupTTL)
+			c.coreIpDomainCache.SaveWithTTL(hashKey, coreIpDomainCacheValue{qHash: qHash, qname: qname, ip: ip, bitmap: bitmap}, lookupTTL)
 			continue
 		}
 		// allZero could be true when SniffVerifyMode is 'loose'. It means no need to update ebpf map, but still need to
@@ -617,7 +618,7 @@ func (c *DnsController) updateLookupCache(qname string, domainBitmap []uint32, a
 			go newLookupCacheAsync(c, ip, bitmap)
 		}
 		c.lookupCache[qHash]++
-		c.coreIpDomainCache.SaveWithTTL(hashKey, coreIpDomainCacheValue{qHash: qHash, ip: ip, bitmap: bitmap}, lookupTTL)
+		c.coreIpDomainCache.SaveWithTTL(hashKey, coreIpDomainCacheValue{qHash: qHash, qname: qname, ip: ip, bitmap: bitmap}, lookupTTL)
 		common.Metrics.CoreIpDomainBitmap.With0().Inc()
 	}
 	return nil
@@ -865,6 +866,89 @@ func (c *DnsController) UpdateStaticEntry(name string, entry *config.DnsStaticEn
 	return c.routing.UpdateStaticEntry(name, entry)
 }
 
+// ReplayDomainBitmaps recomputes the routing bitmap for every cached
+// (domain, IP) pair using the supplied matchBitmap callback, which should
+// be backed by the new routing matcher. On mismatch the BPF domain maps
+// are updated and the cache entry rewritten. Called from UpdateRouting()
+// to correct domain routing state without purging DNS data.
+func (c *DnsController) ReplayDomainBitmaps(matchBitmap func(fqdn string, bitmap []uint32)) {
+	// Collect entries whose bitmap changed; SaveWithTTL takes the cache
+	// write-lock, which must not be called inside Range (which holds RLock).
+	updates := make(map[HashKey]coreIpDomainCacheValue)
+
+	c.coreIpDomainCache.Range(func(key HashKey, v coreIpDomainCacheValue) bool {
+		if v.qname == "" || v.bitmap == nil {
+			return true
+		}
+		oldBitmap := v.bitmap
+		newSlice := common.ObtainDomainBitmap()
+		matchBitmap(v.qname, newSlice)
+		newBitmap := (*[32]uint32)(newSlice)
+
+		if *oldBitmap == *newBitmap {
+			common.RecycleDomainBitmap(newSlice)
+			return true
+		}
+
+		// Remove old BPF entries, add new ones.
+		if err := c.lookupCacheTimeout(v.ip, oldBitmap); err != nil {
+			log.WithField("ip", v.ip).WithField("err", err).
+				Warn("ReplayDomainBitmaps: failed to remove old domain state")
+		}
+		allZero := true
+		for _, w := range newBitmap {
+			if w != 0 {
+				allZero = false
+				break
+			}
+		}
+		if !allZero {
+			if err := c.newLookupCache(v.ip, newBitmap); err != nil {
+				log.WithField("ip", v.ip).WithField("err", err).
+					Warn("ReplayDomainBitmaps: failed to add new domain state")
+			}
+		}
+		updates[key] = coreIpDomainCacheValue{
+			qHash:  v.qHash,
+			qname:  v.qname,
+			ip:     v.ip,
+			bitmap: newBitmap,
+		}
+		return true
+	})
+
+	for key, val := range updates {
+		c.coreIpDomainCache.SaveWithTTL(key, val, 1*time.Hour)
+	}
+}
+
+// TransferDomainState moves all domain cache entries from c to dst so
+// that the BPF domain maps stay in sync with the surviving controller.
+// Called from UpdateDns() before the old DnsController is closed.
+func (c *DnsController) TransferDomainState(dst *DnsController) {
+	c.mu.Lock()
+	dst.mu.Lock()
+	defer c.mu.Unlock()
+	defer dst.mu.Unlock()
+
+	// Transfer lookupCache. Plain map, no callbacks — direct assignment is safe.
+	dst.lookupCache = c.lookupCache
+	c.lookupCache = nil // prevent Close from clearing it
+
+	// Transfer all coreIpDomainCache entries.
+	c.coreIpDomainCache.Range(func(key HashKey, v coreIpDomainCacheValue) bool {
+		// Use a long TTL so entries survive until the next real DNS
+		// lookup refreshes them with the correct TTL from the new
+		// controller's requestSelectCache.
+		dst.coreIpDomainCache.SaveWithTTL(key, v, 1*time.Hour)
+		return true
+	})
+	// Stop the old cache's janitor but don't let it walk over entries
+	// that have already been moved — close it after Range.
+	c.coreIpDomainCache.Close()
+	c.coreIpDomainCache = nil
+}
+
 func (c *DnsController) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -873,8 +957,12 @@ func (c *DnsController) Close() error {
 	c.dnsCache.Close()
 
 	// Clean up cache & deadline timers.
-	c.coreIpDomainCache.Close()
-	c.lookupCache = make(map[HashKey]uint16)
+	if c.coreIpDomainCache != nil {
+		c.coreIpDomainCache.Close()
+	}
+	if c.lookupCache != nil {
+		c.lookupCache = make(map[HashKey]uint16)
+	}
 
 	// Close all DNS forwarders
 	c.dnsForwarderCache.Range(func(key, value any) bool {

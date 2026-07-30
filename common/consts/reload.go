@@ -18,3 +18,17 @@ const (
 	UpdateSubDone
 	UpdateSubError
 )
+
+const (
+	UpdateDnsSend = '8' + iota
+	UpdateDnsProcessing
+	UpdateDnsDone
+	UpdateDnsError
+)
+
+const (
+	UpdateRoutingSend = '<' + iota
+	UpdateRoutingProcessing
+	UpdateRoutingDone
+	UpdateRoutingError
+)

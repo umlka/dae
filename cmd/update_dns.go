@@ -19,10 +19,10 @@ import (
 )
 
 var (
-	updateSubCmd = &cobra.Command{
-		Use:     "sub [pid]",
-		Aliases: []string{"update-sub"},
-		Short:   "Re-fetch subscriptions and update dialers without full reload.",
+	updateDnsCmd = &cobra.Command{
+		Use:     "dns [pid]",
+		Aliases: []string{"update-dns"},
+		Short:   "Apply DNS configuration changes without full reload.",
 		Run: func(cmd *cobra.Command, args []string) {
 			internal.AutoSu()
 
@@ -41,49 +41,46 @@ var (
 				os.Exit(1)
 			}
 
-			// Read the first line of SignalProgressFilePath.
+			// Check for in-progress operations.
 			code, _, err := readSignalProgressFile()
 			if err == nil && code != consts.ReloadDone && code != consts.ReloadError &&
 				code != consts.UpdateSubDone && code != consts.UpdateSubError &&
 				code != consts.UpdateDnsDone && code != consts.UpdateDnsError &&
 				code != consts.UpdateRoutingDone && code != consts.UpdateRoutingError {
-				// In progress.
 				fmt.Printf("%v shows another operation is in progress.\n", SignalProgressFilePath)
 				return
 			}
 
-			// Set the progress as UpdateSubSend.
-			os.WriteFile(SignalProgressFilePath, []byte{consts.UpdateSubSend}, 0644)
+			os.WriteFile(SignalProgressFilePath, []byte{consts.UpdateDnsSend}, 0644)
 
-			// Send SIGHUP to trigger subscription update.
+			// Send SIGHUP to trigger DNS update.
 			if err = syscall.Kill(pid, syscall.SIGHUP); err != nil {
 				fmt.Println(err)
 				os.Exit(1)
 			}
 			time.Sleep(500 * time.Millisecond)
 			code, _, _ = readSignalProgressFile()
-			if code == consts.UpdateSubSend {
-				// Old version dae is running.
-				goto fallback
+			if code == consts.UpdateDnsSend {
+				fmt.Println("OK")
+				return
 			}
 
 			for {
 				time.Sleep(200 * time.Millisecond)
 				code, content, err := readSignalProgressFile()
 				if err != nil {
-					goto fallback
+					fmt.Println("OK")
+					return
 				}
-				if code == consts.UpdateSubDone || code == consts.UpdateSubError {
+				if code == consts.UpdateDnsDone || code == consts.UpdateDnsError {
 					fmt.Println(content)
 					return
 				}
 			}
-		fallback:
-			fmt.Println("OK")
 		},
 	}
 )
 
 func init() {
-	updateCmd.AddCommand(updateSubCmd)
+	updateCmd.AddCommand(updateDnsCmd)
 }
