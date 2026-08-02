@@ -25,7 +25,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/features"
@@ -33,7 +32,6 @@ import (
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/assets"
 	"github.com/daeuniverse/dae/common/consts"
-	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/dae/common/subscription"
 	"github.com/daeuniverse/dae/component/dns"
 	"github.com/daeuniverse/dae/component/outbound"
@@ -66,7 +64,7 @@ type ControlPlane struct {
 	deferFuncs []func() error
 	listenIp   string
 
-	// TODO: add mutex?
+	// no need mutex for outbounds.
 	outbounds              []*outbound.DialerGroup
 	noConnectivityOutbound consts.OutboundIndex
 	inConnections          sync.Map
@@ -77,9 +75,6 @@ type ControlPlane struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
-
-	muRealDomainSet sync.Mutex
-	realDomainSet   *bloom.BloomFilter
 
 	wanInterface []string
 	lanInterface []string
@@ -122,8 +117,7 @@ type ControlPlane struct {
 
 // TODO: 统一 Outbound 中的DNS解析器
 // TODO: Hy2 的 mark 支持
-// TODO: Connectivity Check Failed 仅将状态变更作为 Warning、
-// HandlePkt HandleConn 分割 Route 和 Dial
+// TODO: HandlePkt HandleConn 分割 Route 和 Dial
 func NewControlPlane(
 	_bpf interface{},
 	tagToNodeList map[string][]string,
@@ -453,8 +447,6 @@ func NewControlPlane(
 		routingMatcher:         routingMatcher,
 		ctx:                    ctx,
 		cancel:                 cancel,
-		muRealDomainSet:        sync.Mutex{},
-		realDomainSet:          bloom.NewWithEstimates(2048, 0.001),
 		lanInterface:           global.LanInterface,
 		wanInterface:           global.WanInterface,
 		dialTargetOverride:     global.DialTargetOverride,
@@ -1021,21 +1013,12 @@ func (c *ControlPlane) VerifySniff(outbound consts.OutboundIndex, dst netip.Addr
 		case consts.SniffVerifyMode_Strict:
 			verified = false
 		case consts.SniffVerifyMode_Loose:
-			// TODO: 产生一个真的DNS查询? 这样能被缓存
-			c.muRealDomainSet.Lock()
-			verified = c.realDomainSet.TestString(fqdn) // Test if the domain is in real-domain set.
-			c.muRealDomainSet.Unlock()
-			if !verified {
-				// Lookup A/AAAA to make sure it is a real domain.
-				// TODO: 这里可能可以直接使用正常的 DNS 解析流程, 从而可以得到缓存
-				if ip46, err := netutils.ResolveIp46(fqdn); err == nil && ip46.IsValid() {
-					// Has A/AAAA records. It is a real domain.
-					// Add it to real-domain set.
-					c.muRealDomainSet.Lock()
-					c.realDomainSet.AddString(fqdn)
-					c.muRealDomainSet.Unlock()
-					verified = true
-				}
+			// Fast path: check sniffDomainCache populated by normal DNS traffic.
+			if _, ok := c.dnsController.sniffDomainCache.Get(qHash); ok {
+				verified = true
+			} else {
+				// Slow path: trigger real DNS query through DAE pipeline.
+				verified = c.dnsController.ResolveForVerification(fqdn)
 			}
 		}
 	}

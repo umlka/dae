@@ -32,7 +32,6 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// TODO: Lookup Cache 的 GC
 // TODO: reload时保留lookup cache
 
 const (
@@ -92,6 +91,7 @@ type DnsController struct {
 	mu                sync.Mutex
 	lookupCache       map[HashKey]uint16                                      // Key: Hash by qname
 	coreIpDomainCache *common.TimeWheelCache[HashKey, coreIpDomainCacheValue] // Key: Hash by qname + ip
+	sniffDomainCache  *common.TimeWheelCache[HashKey, struct{}]               // Key: Hash by qname; populated by DNS pipeline, used by VerifySniff for fast domain verification
 	sniffVerifyMode   consts.SniffVerifyMode
 
 	singleFlightGroup common.SingleFlight[HashKey, *dnsmessage.Msg, singleFlightParam]
@@ -134,6 +134,7 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		dnsCache:           newCommonDnsCache(),
 		dnsCacheHashSeed:   maphash.MakeSeed(),
 		requestSelectCache: common.NewTimeWheelCache[HashKey, consts.DnsRequestOutboundIndex](1*time.Hour, 5*time.Second, nil),
+		sniffDomainCache:   common.NewTimeWheelCache[HashKey, struct{}](1*time.Hour, 5*time.Second, nil),
 		lookupCache:        make(map[HashKey]uint16),
 	}
 	c.coreIpDomainCache = common.NewTimeWheelCache(
@@ -281,7 +282,6 @@ func (c *DnsController) Handle(dnsMessage *dnsmessage.Msg, req *dnsRequest) {
 				dnsMessage2.Question[0].Qtype = dnsmessage.TypeA
 			}
 
-			// TODO: ignoreFixedTTL?
 			errCh := make(chan error, 1)
 			go func() {
 				err = c.handleDNSRequest(dnsMessage2, req, queryInfo)
@@ -328,9 +328,6 @@ func (c *DnsController) Handle(dnsMessage *dnsmessage.Msg, req *dnsRequest) {
 	}
 }
 
-// TODO: 除了dialSend, 不应该有可预期的 err
-// TODO: qname=. qtype=2 的查询是什么, 为什么没有缓存, 因为AsIs?
-// TODO: 如果AsIs都不缓存的话，如果一个server可用一个不可用，那就是远端sever的问题?
 func (c *DnsController) handleDNSRequest(
 	dnsMessage *dnsmessage.Msg,
 	req *dnsRequest,
@@ -474,7 +471,6 @@ Dial:
 		upstream = nextUpstream
 		reqMsg.CopyTo(dnsMessage)
 	}
-
 	// Update lookup cache.
 	switch {
 	case !dnsMessage.Response,
@@ -484,24 +480,77 @@ Dial:
 		return nil
 	}
 	if isNew {
+		var ttl uint32
+		var ips []netip.Addr
+		for _, rr := range dnsMessage.Answer {
+			if ttl == 0 {
+				ttl = rr.Header().Ttl
+			}
+			ip, ok := GetIp(rr)
+			if ok {
+				ips = append(ips, ip)
+			}
+		}
+		// Populate sniffDomainCache for fast VerifySniff lookup.
+		// This cache is independent of routing rules — it only tracks
+		// whether a domain has valid DNS records, regardless of qtype,
+		// outbound, or dialer.
+		if len(ips) > 0 {
+			qHash := c.QnameHash(queryInfo.qname)
+			lookupTTL := max(time.Duration(ttl)*time.Second, c.minSniffingTtl)
+			c.sniffDomainCache.SaveWithTTL(qHash, struct{}{}, lookupTTL)
+		}
+		// Update eBPF lookup cache.
 		domainBitmap := common.ObtainDomainBitmap()
 		defer common.RecycleDomainBitmap(domainBitmap)
 		if allZero, shouldUpdate := c.checkDomainBitmap(queryInfo.qname, domainBitmap); shouldUpdate {
-			var ttl uint32
-			var ips []netip.Addr
-			for _, rr := range dnsMessage.Answer {
-				if ttl == 0 {
-					ttl = rr.Header().Ttl
-				}
-				ip, ok := GetIp(rr)
-				if ok {
-					ips = append(ips, ip)
-				}
-			}
 			return c.updateLookupCache(queryInfo.qname, domainBitmap, allZero, ips, time.Duration(ttl)*time.Second)
 		}
 	}
 	return nil
+}
+
+// ResolveForVerification triggers a real DNS query through DAE's full DNS pipeline
+// (routing, upstream selection, forwarding, caching, and eBPF domain sync).
+// It is used by VerifySniff as the slow path when sniffDomainCache misses,
+// replacing the old netutils.ResolveIp46 which bypassed DAE and leaked DNS.
+func (c *DnsController) ResolveForVerification(fqdn string) (ok bool) {
+	// fqdn may be an IP literal (e.g. from SNI when connecting to an IP
+	// directly). Skip DNS lookup — IPs don't have A/AAAA records.
+	if _, err := netip.ParseAddr(strings.TrimSuffix(fqdn, ".")); err == nil {
+		return false
+	}
+
+	// Try A first; if it resolves, skip AAAA. Verification only needs to
+	// confirm the domain has DNS records — one record type is sufficient.
+	for _, qtype := range []uint16{dnsmessage.TypeA, dnsmessage.TypeAAAA} {
+		msg := new(dnsmessage.Msg)
+		msg.SetQuestion(dnsmessage.Fqdn(fqdn), qtype)
+		msg.RecursionDesired = true
+
+		// handleDNSRequest handles routing (RequestSelect, race groups),
+		// upstream resolution, forwarding, and auto-populates
+		// sniffDomainCache, dnsCache, lookupCache, coreIpDomainCache,
+		// and eBPF maps. Zero MAC and source IP because VerifySniff has
+		// no client context; source-based rules fall through to default.
+		req := ObtainDnsRequest(netip.AddrPort{}, netip.AddrPort{}, &bpfRoutingResult{}, false)
+		qi := queryInfo{qname: fqdn, qtype: qtype}
+		pipeErr := c.handleDNSRequest(msg, req, qi)
+		RecycleDnsRequest(req)
+		if pipeErr != nil {
+			log.WithField("qname", fqdn).WithField("qtype", qtype).
+				Warnf("ResolveForVerification: %v", pipeErr)
+			continue
+		}
+		for _, rr := range msg.Answer {
+			if _, ok := GetIp(rr); ok {
+				return true
+			}
+		}
+		log.WithField("qname", fqdn).WithField("qtype", qtype).
+			Warnf("ResolveForVerification: no IPs resolved")
+	}
+	return false
 }
 
 // handleDNSRequestRace sends DNS queries to multiple upstreams concurrently and uses the
@@ -874,9 +923,14 @@ func (c *DnsController) UpdateStaticEntry(name string, entry *config.DnsStaticEn
 func (c *DnsController) ReplayDomainBitmaps(matchBitmap func(fqdn string, bitmap []uint32)) {
 	// Collect entries whose bitmap changed; SaveWithTTL takes the cache
 	// write-lock, which must not be called inside Range (which holds RLock).
-	updates := make(map[HashKey]coreIpDomainCacheValue)
+	type updateEntry struct {
+		key HashKey
+		val coreIpDomainCacheValue
+		ttl time.Duration
+	}
+	updates := make([]updateEntry, 0, 16)
 
-	c.coreIpDomainCache.Range(func(key HashKey, v coreIpDomainCacheValue) bool {
+	c.coreIpDomainCache.Range(func(key HashKey, v coreIpDomainCacheValue, ttl time.Duration) bool {
 		if v.qname == "" || v.bitmap == nil {
 			return true
 		}
@@ -908,17 +962,21 @@ func (c *DnsController) ReplayDomainBitmaps(matchBitmap func(fqdn string, bitmap
 					Warn("ReplayDomainBitmaps: failed to add new domain state")
 			}
 		}
-		updates[key] = coreIpDomainCacheValue{
-			qHash:  v.qHash,
-			qname:  v.qname,
-			ip:     v.ip,
-			bitmap: newBitmap,
-		}
+		updates = append(updates, updateEntry{
+			key: key,
+			val: coreIpDomainCacheValue{
+				qHash:  v.qHash,
+				qname:  v.qname,
+				ip:     v.ip,
+				bitmap: newBitmap,
+			},
+			ttl: ttl,
+		})
 		return true
 	})
 
-	for key, val := range updates {
-		c.coreIpDomainCache.SaveWithTTL(key, val, 1*time.Hour)
+	for _, entry := range updates {
+		c.coreIpDomainCache.SaveWithTTL(entry.key, entry.val, entry.ttl)
 	}
 }
 
@@ -936,15 +994,10 @@ func (c *DnsController) TransferDomainState(dst *DnsController) {
 	c.lookupCache = nil // prevent Close from clearing it
 
 	// Transfer all coreIpDomainCache entries.
-	c.coreIpDomainCache.Range(func(key HashKey, v coreIpDomainCacheValue) bool {
-		// Use a long TTL so entries survive until the next real DNS
-		// lookup refreshes them with the correct TTL from the new
-		// controller's requestSelectCache.
-		dst.coreIpDomainCache.SaveWithTTL(key, v, 1*time.Hour)
+	c.coreIpDomainCache.Range(func(key HashKey, v coreIpDomainCacheValue, ttl time.Duration) bool {
+		dst.coreIpDomainCache.SaveWithTTL(key, v, ttl)
 		return true
 	})
-	// Stop the old cache's janitor but don't let it walk over entries
-	// that have already been moved — close it after Range.
 	c.coreIpDomainCache.Close()
 	c.coreIpDomainCache = nil
 }
