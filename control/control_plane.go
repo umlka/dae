@@ -963,63 +963,36 @@ func (c *ControlPlane) cacheDnsUpstream(dnsUpstream *dns.Upstream) {
 // shouldReroute 返回 Kernel 是否有可能没有正确 Route
 // SniffVerifyMode_Loose 在这个域名存在时, 通过认证
 // SniffVerifyMode_Strict 在这个域名尝试过对应的 DNS 解析时, 通过认证
-func (c *ControlPlane) VerifySniff(outbound consts.OutboundIndex, dst netip.AddrPort, domain string) (verified bool, shouldRerouteFunc func() bool) {
+func (c *ControlPlane) VerifySniff(outbound consts.OutboundIndex, dst netip.AddrPort, domain string, src netip.AddrPort, routingResult *bpfRoutingResult) (verified bool, shouldRerouteFunc func() bool) {
 	if domain == "" {
 		return
 	}
 	fqdn := common.CanonicalName(domain)
 	qHash := c.dnsController.QnameHash(fqdn)
-	var hasIpForDomain, isDstInIps bool
-	c.dnsController.mu.Lock()
-	if n, ok := c.dnsController.lookupCache[qHash]; ok && n > 0 {
-		hasIpForDomain = true
-		_, isDstInIps = c.dnsController.coreIpDomainCache.Get(QnameIpHash(qHash, dst.Addr()))
-	}
-	c.dnsController.mu.Unlock()
-
-	if hasIpForDomain {
-		// Successful sniff without DNS lookup record.
-		// In this case, the kernel may not handle domain match set, so re-route is required.
-		switch c.sniffVerifyMode {
-		case consts.SniffVerifyMode_None, consts.SniffVerifyMode_Loose:
-			verified = true
-			shouldRerouteFunc = func() bool {
-				return !isDstInIps
-			}
-		case consts.SniffVerifyMode_Strict:
-			verified = isDstInIps
-			shouldRerouteFunc = func() bool {
-				return !isDstInIps
-			}
-		}
+	ipHash := QnameIpHash(qHash, dst.Addr())
+	_, wentThroughKernelDomainRules := c.dnsController.coreIpDomainCache.Get(ipHash)
+	if wentThroughKernelDomainRules {
+		shouldRerouteFunc = func() bool { return false }
 	} else {
-		// Successful sniff without DNS lookup record.
-		// Only tries to reroute when the domain is mentioned in routing rules.
 		shouldRerouteFunc = func() bool {
-			bitmap := common.ObtainDomainBitmap()
-			defer common.RecycleDomainBitmap(bitmap)
-			c.routingMatcher.domainMatcher.MatchDomainBitmapInplace(fqdn, bitmap)
-			for _, v := range bitmap {
-				if v != 0 {
-					return true
-				}
-			}
-			return false
+			return !c.dnsController.isDomainBitmapAllZero(fqdn, nil)
 		}
-		// Check if the domain is in real-domain set (bloom filter).
-		switch c.sniffVerifyMode {
-		case consts.SniffVerifyMode_None:
-			verified = true
-		case consts.SniffVerifyMode_Strict:
-			verified = false
-		case consts.SniffVerifyMode_Loose:
-			// Fast path: check sniffDomainCache populated by normal DNS traffic.
-			if _, ok := c.dnsController.sniffDomainCache.Get(qHash); ok {
-				verified = true
-			} else {
-				// Slow path: trigger real DNS query through DAE pipeline.
-				verified = c.dnsController.ResolveForVerification(fqdn)
-			}
+	}
+
+	switch c.sniffVerifyMode {
+	case consts.SniffVerifyMode_None:
+		verified = true
+	case consts.SniffVerifyMode_Strict:
+		verified = wentThroughKernelDomainRules
+		if !verified {
+			_, verified = c.dnsController.sniffDomainCache.Get(ipHash)
+		}
+	case consts.SniffVerifyMode_Loose:
+		verified = wentThroughKernelDomainRules
+		if !verified {
+			_, hasIpForDomain := c.dnsController.sniffDomainCache.Get(qHash)
+			// Slow path: trigger real DNS query through DAE pipeline.
+			verified = hasIpForDomain || c.dnsController.ResolveForVerification(fqdn, src, routingResult)
 		}
 	}
 	return

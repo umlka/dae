@@ -87,12 +87,9 @@ type DnsController struct {
 	dnsCacheHashSeed   maphash.Seed
 	dnsForwarderCache  sync.Map // map[dnsForwarderKey]DnsForwarder
 	requestSelectCache *common.TimeWheelCache[HashKey, consts.DnsRequestOutboundIndex]
-	// mu protects lookupCache
-	mu                sync.Mutex
-	lookupCache       map[HashKey]uint16                                      // Key: Hash by qname
-	coreIpDomainCache *common.TimeWheelCache[HashKey, coreIpDomainCacheValue] // Key: Hash by qname + ip
-	sniffDomainCache  *common.TimeWheelCache[HashKey, struct{}]               // Key: Hash by qname; populated by DNS pipeline, used by VerifySniff for fast domain verification
-	sniffVerifyMode   consts.SniffVerifyMode
+	coreIpDomainCache  *common.TimeWheelCache[HashKey, coreIpDomainCacheValue] // Key: Hash by qname + ip
+	sniffDomainCache   *common.TimeWheelCache[HashKey, struct{}]               // Key: Loose mode hashes by qname; Strict mode hashes by qname+ip. Used by VerifySniff.
+	sniffVerifyMode    consts.SniffVerifyMode
 
 	singleFlightGroup common.SingleFlight[HashKey, *dnsmessage.Msg, singleFlightParam]
 }
@@ -135,12 +132,11 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		dnsCacheHashSeed:   maphash.MakeSeed(),
 		requestSelectCache: common.NewTimeWheelCache[HashKey, consts.DnsRequestOutboundIndex](1*time.Hour, 5*time.Second, nil),
 		sniffDomainCache:   common.NewTimeWheelCache[HashKey, struct{}](1*time.Hour, 5*time.Second, nil),
-		lookupCache:        make(map[HashKey]uint16),
 	}
 	c.coreIpDomainCache = common.NewTimeWheelCache(
 		1*time.Hour, 5*time.Second, func(_ HashKey, v coreIpDomainCacheValue, replaced bool) {
 			if !replaced {
-				c.recycleLookupCache(v.qHash, v.ip, v.bitmap)
+				c.recycleLookupCache(v.ip, v.bitmap)
 			}
 		})
 	return c, nil
@@ -491,20 +487,26 @@ Dial:
 				ips = append(ips, ip)
 			}
 		}
-		// Populate sniffDomainCache for fast VerifySniff lookup.
-		// This cache is independent of routing rules — it only tracks
-		// whether a domain has valid DNS records, regardless of qtype,
-		// outbound, or dialer.
-		if len(ips) > 0 {
+		// SniffVerifyMode_None never uses sniffDomainCache — skip entirely.
+		if len(ips) > 0 && c.sniffVerifyMode != consts.SniffVerifyMode_None {
 			qHash := c.QnameHash(queryInfo.qname)
 			lookupTTL := max(time.Duration(ttl)*time.Second, c.minSniffingTtl)
-			c.sniffDomainCache.SaveWithTTL(qHash, struct{}{}, lookupTTL)
+			switch c.sniffVerifyMode {
+			case consts.SniffVerifyMode_Loose:
+				// Loose mode: key by qname only; existence signals "was resolved".
+				c.sniffDomainCache.SaveWithTTL(qHash, struct{}{}, lookupTTL)
+			case consts.SniffVerifyMode_Strict:
+				// Strict mode: key by qname+ip for per-IP exact matching.
+				for _, ip := range ips {
+					c.sniffDomainCache.SaveWithTTL(QnameIpHash(qHash, ip), struct{}{}, lookupTTL)
+				}
+			}
 		}
 		// Update eBPF lookup cache.
 		domainBitmap := common.ObtainDomainBitmap()
 		defer common.RecycleDomainBitmap(domainBitmap)
-		if allZero, shouldUpdate := c.checkDomainBitmap(queryInfo.qname, domainBitmap); shouldUpdate {
-			return c.updateLookupCache(queryInfo.qname, domainBitmap, allZero, ips, time.Duration(ttl)*time.Second)
+		if !c.isDomainBitmapAllZero(queryInfo.qname, domainBitmap) {
+			return c.updateLookupCache(queryInfo.qname, domainBitmap, ips, time.Duration(ttl)*time.Second)
 		}
 	}
 	return nil
@@ -514,7 +516,7 @@ Dial:
 // (routing, upstream selection, forwarding, caching, and eBPF domain sync).
 // It is used by VerifySniff as the slow path when sniffDomainCache misses,
 // replacing the old netutils.ResolveIp46 which bypassed DAE and leaked DNS.
-func (c *DnsController) ResolveForVerification(fqdn string) (ok bool) {
+func (c *DnsController) ResolveForVerification(fqdn string, src netip.AddrPort, routingResult *bpfRoutingResult) (ok bool) {
 	// fqdn may be an IP literal (e.g. from SNI when connecting to an IP
 	// directly). Skip DNS lookup — IPs don't have A/AAAA records.
 	if _, err := netip.ParseAddr(strings.TrimSuffix(fqdn, ".")); err == nil {
@@ -531,9 +533,9 @@ func (c *DnsController) ResolveForVerification(fqdn string) (ok bool) {
 		// handleDNSRequest handles routing (RequestSelect, race groups),
 		// upstream resolution, forwarding, and auto-populates
 		// sniffDomainCache, dnsCache, lookupCache, coreIpDomainCache,
-		// and eBPF maps. Zero MAC and source IP because VerifySniff has
-		// no client context; source-based rules fall through to default.
-		req := ObtainDnsRequest(netip.AddrPort{}, netip.AddrPort{}, &bpfRoutingResult{}, false)
+		// and eBPF maps.
+		// Dst is only used in case of ASIS, hard-code localhost:53 here.
+		req := ObtainDnsRequest(src, netip.MustParseAddrPort("127.0.0.1:53"), routingResult, false)
 		qi := queryInfo{qname: fqdn, qtype: qtype}
 		pipeErr := c.handleDNSRequest(msg, req, qi)
 		RecycleDnsRequest(req)
@@ -622,23 +624,21 @@ func (c *DnsController) logDnsResponse(req *dnsRequest, dialArgument *dialArgume
 	)
 }
 
-func (c *DnsController) checkDomainBitmap(qname string, domainBitmap []uint32) (allZero bool, shouldUpdateLookupCache bool) {
+func (c *DnsController) isDomainBitmapAllZero(qname string, domainBitmap []uint32) bool {
+	if domainBitmap == nil {
+		domainBitmap = common.ObtainDomainBitmap()
+		defer common.RecycleDomainBitmap(domainBitmap)
+	}
 	c.matchBitmap(qname, domainBitmap)
-	allZero = true
 	for _, v := range domainBitmap {
 		if v != 0 {
-			allZero = false
-			break
+			return false
 		}
 	}
-	// When SniffVerifyMode is 'loose' and no record in deadline timers, ControlPlane would try
-	// to resolve IPs for sniffing verification, which might cause dns leaks! So only skip the
-	// lookup cache update when SniffVerifyMode isn't 'loose'.
-	shouldUpdateLookupCache = !allZero || c.sniffVerifyMode == consts.SniffVerifyMode_Loose
-	return
+	return true
 }
 
-func (c *DnsController) updateLookupCache(qname string, domainBitmap []uint32, allZero bool, ips []netip.Addr, ttl time.Duration) error {
+func (c *DnsController) updateLookupCache(qname string, domainBitmap []uint32, ips []netip.Addr, ttl time.Duration) error {
 	if len(ips) == 0 {
 		return nil
 	}
@@ -647,46 +647,23 @@ func (c *DnsController) updateLookupCache(qname string, domainBitmap []uint32, a
 
 	qHash := c.QnameHash(qname)
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if _, ok := c.lookupCache[qHash]; !ok {
-		c.lookupCache[qHash] = 0
-	}
-
 	for _, ip := range ips {
 		hashKey := QnameIpHash(qHash, ip)
-		if _, ok := c.coreIpDomainCache.Get(hashKey); ok {
+		if v, ok := c.coreIpDomainCache.Get(hashKey); ok {
 			// Just update ttl, no need to update ebpf map.
-			c.coreIpDomainCache.SaveWithTTL(hashKey, coreIpDomainCacheValue{qHash: qHash, qname: qname, ip: ip, bitmap: bitmap}, lookupTTL)
+			c.coreIpDomainCache.SaveWithTTL(hashKey, v, lookupTTL)
 			continue
 		}
-		// allZero could be true when SniffVerifyMode is 'loose'. It means no need to update ebpf map, but still need to
-		// update lookup cache because VerifySniff needs to know domain-ip existence.
-		if !allZero {
-			go newLookupCacheAsync(c, ip, bitmap)
-		}
-		c.lookupCache[qHash]++
+		go newLookupCacheAsync(c, ip, bitmap)
 		c.coreIpDomainCache.SaveWithTTL(hashKey, coreIpDomainCacheValue{qHash: qHash, qname: qname, ip: ip, bitmap: bitmap}, lookupTTL)
 		common.Metrics.CoreIpDomainBitmap.With0().Inc()
 	}
 	return nil
 }
 
-func (c *DnsController) recycleLookupCache(qHash HashKey, ip netip.Addr, bitmap *[32]uint32) {
+func (c *DnsController) recycleLookupCache(ip netip.Addr, bitmap *[32]uint32) {
 	go lookupCacheTimeoutAsync(c, ip, bitmap)
 	common.Metrics.CoreIpDomainBitmap.With0().Dec()
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if n, ok := c.lookupCache[qHash]; ok {
-		if n > 1 {
-			c.lookupCache[qHash] = n - 1
-			return
-		}
-		delete(c.lookupCache, qHash)
-	}
 }
 
 func newLookupCacheAsync(c *DnsController, ip netip.Addr, domainBitmap *[32]uint32) {
@@ -707,8 +684,8 @@ func (c *DnsController) MaybeUpdateLookupCache(qname string, ips []netip.Addr, t
 	}
 	domainBitmap := common.ObtainDomainBitmap()
 	defer common.RecycleDomainBitmap(domainBitmap)
-	if allZero, shouldUpdate := c.checkDomainBitmap(qname, domainBitmap); shouldUpdate {
-		return c.updateLookupCache(qname, domainBitmap, allZero, ips, ttl)
+	if !c.isDomainBitmapAllZero(qname, domainBitmap) {
+		return c.updateLookupCache(qname, domainBitmap, ips, ttl)
 	}
 	return nil
 }
@@ -984,15 +961,6 @@ func (c *DnsController) ReplayDomainBitmaps(matchBitmap func(fqdn string, bitmap
 // that the BPF domain maps stay in sync with the surviving controller.
 // Called from UpdateDns() before the old DnsController is closed.
 func (c *DnsController) TransferDomainState(dst *DnsController) {
-	c.mu.Lock()
-	dst.mu.Lock()
-	defer c.mu.Unlock()
-	defer dst.mu.Unlock()
-
-	// Transfer lookupCache. Plain map, no callbacks — direct assignment is safe.
-	dst.lookupCache = c.lookupCache
-	c.lookupCache = nil // prevent Close from clearing it
-
 	// Transfer all coreIpDomainCache entries.
 	c.coreIpDomainCache.Range(func(key HashKey, v coreIpDomainCacheValue, ttl time.Duration) bool {
 		dst.coreIpDomainCache.SaveWithTTL(key, v, ttl)
@@ -1003,18 +971,12 @@ func (c *DnsController) TransferDomainState(dst *DnsController) {
 }
 
 func (c *DnsController) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	c.requestSelectCache.Close()
 	c.dnsCache.Close()
 
 	// Clean up cache & deadline timers.
 	if c.coreIpDomainCache != nil {
 		c.coreIpDomainCache.Close()
-	}
-	if c.lookupCache != nil {
-		c.lookupCache = make(map[HashKey]uint16)
 	}
 
 	// Close all DNS forwarders
