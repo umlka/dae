@@ -7,147 +7,75 @@ package control
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"net/netip"
-	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
 
-	"github.com/daeuniverse/dae/component/outbound/dialer"
 	"golang.org/x/sys/unix"
+
+	log "github.com/sirupsen/logrus"
+
+	"github.com/daeuniverse/dae/component/outbound/dialer"
+	"github.com/daeuniverse/outbound/pool"
 )
+
+// mmsghdr mirrors Linux struct mmsghdr for sendmmsg(2).
+// Not defined in x/sys/unix, so we define it here.
+type mmsghdr struct {
+	hdr    unix.Msghdr
+	msgLen uint32
+	_      [4]byte // pad to 64 bytes; kernel strides at 64 B
+}
+
+const (
+	sendBufSlots   = 16
+	sendBufTimeout = 10 * time.Millisecond
+
+	// batchThreshold is the number of direct writes before the
+	// connection switches permanently from direct sendto to batched
+	// sendmmsg.  Below this threshold, writes go directly to avoid
+	// the timer latency for sparse traffic like H3 page loads.
+	batchThreshold = sendBufSlots / 2 // 8
+)
+
+type sendReq struct {
+	data []byte // pool buffer, freed after flush
+	dst  netip.AddrPort
+}
+
+type sendBuf struct {
+	mu    sync.Mutex
+	reqs  [sendBufSlots]sendReq
+	count int
+	timer *time.Timer // fires sendBufTimeout after first request
+}
 
 type Anyfrom struct {
 	*net.UDPConn
 	deadlineTimer *time.Timer
 	ttl           time.Duration
-	// GSO support is modified from quic-go with many thanks.
-	gso         bool
-	gotGSOError bool
-	refCount    int32
-}
+	refCount      int32
 
-func (a *Anyfrom) afterWrite(err error) {
-	if a.gso && !a.gotGSOError && isGSOError(err) {
-		a.gotGSOError = true
-	}
-}
-func (a *Anyfrom) SupportGso(size int) bool {
-	// TODO: We disable GSO because we haven't thought through how to design to use larger packets (we assume the max size of packet is 1500).
-	// See https://github.com/daeuniverse/dae/blob/cab1e4290967340923d7d5ca52b80f781711c18e/control/control_plane.go#L721C37-L721C37.
-	return false
-	// if size > math.MaxUint16 {
-	// 	return false
-	// }
-	// return a.gso && !a.gotGSOError
-}
-func (a *Anyfrom) ReadFrom(b []byte) (int, net.Addr, error) {
-	return a.UDPConn.ReadFrom(b)
-}
-func (a *Anyfrom) ReadFromUDP(b []byte) (n int, addr *net.UDPAddr, err error) {
-	return a.UDPConn.ReadFromUDP(b)
-}
-func (a *Anyfrom) ReadFromUDPAddrPort(b []byte) (n int, addr netip.AddrPort, err error) {
-	return a.UDPConn.ReadFromUDPAddrPort(b)
-}
-func (a *Anyfrom) ReadMsgUDP(b []byte, oob []byte) (n int, oobn int, flags int, addr *net.UDPAddr, err error) {
-	return a.UDPConn.ReadMsgUDP(b, oob)
-}
-func (a *Anyfrom) ReadMsgUDPAddrPort(b []byte, oob []byte) (n int, oobn int, flags int, addr netip.AddrPort, err error) {
-	return a.UDPConn.ReadMsgUDPAddrPort(b, oob)
-}
-func (a *Anyfrom) SyscallConn() (syscall.RawConn, error) {
-	return a.UDPConn.SyscallConn()
-}
-func (a *Anyfrom) WriteMsgUDP(b []byte, oob []byte, addr *net.UDPAddr) (n int, oobn int, err error) {
-	defer func() { a.afterWrite(err) }()
-	if a.SupportGso(len(b)) {
-		return a.UDPConn.WriteMsgUDP(b, appendUDPSegmentSizeMsg(oob, uint16(len(b))), addr)
-	}
-	return a.UDPConn.WriteMsgUDP(b, oob, addr)
-}
-func (a *Anyfrom) WriteMsgUDPAddrPort(b []byte, oob []byte, addr netip.AddrPort) (n int, oobn int, err error) {
-	defer func() { a.afterWrite(err) }()
-	if a.SupportGso(len(b)) {
-		return a.UDPConn.WriteMsgUDPAddrPort(b, appendUDPSegmentSizeMsg(oob, uint16(len(b))), addr)
-	}
-	return a.UDPConn.WriteMsgUDPAddrPort(b, oob, addr)
-}
-func (a *Anyfrom) WriteTo(b []byte, addr net.Addr) (n int, err error) {
-	defer func() { a.afterWrite(err) }()
-	if a.SupportGso(len(b)) {
-		n, _, err = a.UDPConn.WriteMsgUDP(b, appendUDPSegmentSizeMsg(nil, uint16(len(b))), addr.(*net.UDPAddr))
-		return n, err
-	}
-	return a.UDPConn.WriteTo(b, addr)
-}
-func (a *Anyfrom) WriteToUDP(b []byte, addr *net.UDPAddr) (n int, err error) {
-	defer func() { a.afterWrite(err) }()
-	if a.SupportGso(len(b)) {
-		n, _, err = a.UDPConn.WriteMsgUDP(b, appendUDPSegmentSizeMsg(nil, uint16(len(b))), addr)
-		return n, err
-	}
-	return a.UDPConn.WriteToUDP(b, addr)
-}
-func (a *Anyfrom) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (n int, err error) {
-	defer func() { a.afterWrite(err) }()
-	if a.SupportGso(len(b)) {
-		n, _, err = a.UDPConn.WriteMsgUDPAddrPort(b, appendUDPSegmentSizeMsg(nil, uint16(len(b))), addr)
-		return n, err
-	}
-	return a.UDPConn.WriteToUDPAddrPort(b, addr)
-}
+	// fd is the cached raw file descriptor, obtained once from
+	// SyscallConn().  Used by BatchWriteToAddrPort to bypass the
+	// Go net layer.
+	fd int // 0 = not resolved; real UDP fds are always > 0
 
-// isGSOSupported tests if the kernel supports GSO.
-// Sending with GSO might still fail later on, if the interface doesn't support it (see isGSOError).
-func isGSOSupported(uc *net.UDPConn) bool {
-	// TODO: We disable GSO because we haven't thought through how to design to use larger packets (we assume the max size of packet is 1500).
-	// See https://github.com/daeuniverse/dae/blob/cab1e4290967340923d7d5ca52b80f781711c18e/control/control_plane.go#L721C37-L721C37.
-	return false
-	// conn, err := uc.SyscallConn()
-	// if err != nil {
-	// 	return false
-	// }
-	// disabled, err := strconv.ParseBool(os.Getenv("DAE_DISABLE_GSO"))
-	// if err == nil && disabled {
-	// 	return false
-	// }
-	// var serr error
-	// if err := conn.Control(func(fd uintptr) {
-	// 	_, serr = unix.GetsockoptInt(int(fd), unix.IPPROTO_UDP, unix.UDP_SEGMENT)
-	// }); err != nil {
-	// 	return false
-	// }
-	// return serr == nil
-}
-func isGSOError(err error) bool {
-	var serr *os.SyscallError
-	if errors.As(err, &serr) {
-		// EIO is returned by udp_send_skb() if the device driver does not have tx checksums enabled,
-		// which is a hard requirement of UDP_SEGMENT. See:
-		// https://git.kernel.org/pub/scm/docs/man-pages/man-pages.git/tree/man7/udp.7?id=806eabd74910447f21005160e90957bde4db0183#n228
-		// https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/ipv4/udp.c?h=v6.2&id=c9c3395d5e3dcc6daee66c6908354d47bf98cb0c#n942
-		return serr.Err == unix.EIO || serr.Err == unix.EINVAL
-	}
-	return false
-}
-func appendUDPSegmentSizeMsg(b []byte, size uint16) []byte {
-	startLen := len(b)
-	const dataLen = 2 // payload is a uint16
-	b = append(b, make([]byte, unix.CmsgSpace(dataLen))...)
-	h := (*unix.Cmsghdr)(unsafe.Pointer(&b[startLen]))
-	h.Level = syscall.IPPROTO_UDP
-	h.Type = unix.UDP_SEGMENT
-	h.SetLen(unix.CmsgLen(dataLen))
+	sBuf sendBuf
 
-	// UnixRights uses the private `data` method, but I *think* this achieves the same goal.
-	offset := startLen + unix.CmsgSpace(0)
-	*(*uint16)(unsafe.Pointer(&b[offset])) = size
-	return b
+	// Burst detection: writes are counted in a sliding sendBufTimeout
+	// window.  Below batchThreshold they go direct; above it they switch
+	// to batched sendmmsg.  When the gap since the last write exceeds
+	// sendBufTimeout the counter resets.  Pending batch data is always
+	// flushed by the timer, so no lock is needed here.
+	singleWriteCount atomic.Int64
+	lastWriteNano    atomic.Int64
 }
 
 // AnyfromPool is a full-cone udp listener pool
@@ -229,11 +157,9 @@ func (p *AnyfromPool) createAnyfrom(lAddr netip.AddrPort, ttl time.Duration) (*A
 			initialRefCount = 2
 		}
 		af := &Anyfrom{
-			UDPConn:     afRes.conn,
-			ttl:         ttl,
-			gotGSOError: false,
-			gso:         isGSOSupported(afRes.conn),
-			refCount:    initialRefCount,
+			UDPConn:  afRes.conn,
+			ttl:      ttl,
+			refCount: initialRefCount,
 		}
 
 		p.pool[lAddr] = af
@@ -262,6 +188,185 @@ func (p *AnyfromPool) Obtain(lAddr netip.AddrPort, ttl time.Duration) (conn *Any
 	}
 
 	return p.createAnyfrom(lAddr, ttl)
+}
+
+// ensureFD lazily resolves the raw file descriptor from SyscallConn.
+func (af *Anyfrom) ensureFD() error {
+	if af.fd != 0 {
+		return nil
+	}
+	rawConn, err := af.SyscallConn()
+	if err != nil {
+		return err
+	}
+	return rawConn.Control(func(fd uintptr) {
+		af.fd = int(fd)
+	})
+}
+
+// BatchWriteToAddrPort buffers b and sends it to dst after at most
+// sendBufTimeout.  Batching 8 requests reduces syscall count while
+// keeping worst-case latency bounded to 10 ms.
+func (af *Anyfrom) BatchWriteToAddrPort(b []byte, dst netip.AddrPort) (int, error) {
+	if err := af.ensureFD(); err != nil {
+		return 0, err
+	}
+
+	// Copy data — the caller reuses b after we return.
+	data := pool.GetBuffer(len(b))
+	copy(data, b)
+
+	af.sBuf.mu.Lock()
+
+	idx := af.sBuf.count
+	// If same destination as previous slot, zero the dst so
+	// flushLocked can reuse the previous sockaddr encoding.
+	if idx > 0 && af.sBuf.reqs[idx-1].dst == dst {
+		af.sBuf.reqs[idx] = sendReq{data: data}
+	} else {
+		af.sBuf.reqs[idx] = sendReq{data: data, dst: dst}
+	}
+	af.sBuf.count++
+
+	if af.sBuf.count == 1 {
+		// First request in the batch: arm the flush timer.
+		if af.sBuf.timer == nil {
+			af.sBuf.timer = time.AfterFunc(sendBufTimeout, af.flushSendBuf)
+		} else {
+			af.sBuf.timer.Reset(sendBufTimeout)
+		}
+	} else if af.sBuf.count >= sendBufSlots {
+		// Buffer full — stop the timer and flush now.
+		if af.sBuf.timer != nil {
+			af.sBuf.timer.Reset(time.Hour) // effectively stop the timer
+		}
+		af.flushLocked()
+	}
+
+	af.sBuf.mu.Unlock()
+	return len(b), nil
+}
+
+// WriteToAddrPort writes b to dst, choosing between direct sendto and
+// batched sendmmsg automatically.  Writes are counted in a sliding
+// sendBufTimeout window.  Below batchThreshold they go direct; above
+// it they go batched for the remainder of the window.  When the gap
+// since the last write exceeds sendBufTimeout the counter resets,
+// preventing low-frequency flows (e.g. DoQ) from entering batch mode.
+// Pending batch data is flushed by the timer — no explicit flush is
+// needed on window expiry.
+// Callers that must bypass batching (e.g. DNS, games) can use the
+// promoted WriteToUDPAddrPort directly.
+func (af *Anyfrom) WriteToAddrPort(b []byte, dst netip.AddrPort) (int, error) {
+	now := time.Now().UnixNano()
+	if now-af.lastWriteNano.Load() > sendBufTimeout.Nanoseconds() {
+		af.singleWriteCount.Store(0)
+	}
+	af.lastWriteNano.Store(now)
+
+	if af.singleWriteCount.Add(1) <= batchThreshold {
+		// Flush any pending batch data from a previous window to
+		// preserve packet ordering.  Normally the timer has already
+		// fired, but scheduling delays can leave data stranded.
+		af.flushSendBuf()
+		return af.UDPConn.WriteToUDPAddrPort(b, dst)
+	}
+	return af.BatchWriteToAddrPort(b, dst)
+}
+
+// flushSendBuf is the timer callback; it runs in its own goroutine.
+func (af *Anyfrom) flushSendBuf() {
+	af.sBuf.mu.Lock()
+	af.flushLocked()
+	af.sBuf.mu.Unlock()
+}
+
+// flushLocked drains the batch via sendmmsg(2).  Must hold af.sBuf.mu.
+func (af *Anyfrom) flushLocked() {
+	n := af.sBuf.count
+	if n == 0 {
+		return
+	}
+
+	var msgs [sendBufSlots]mmsghdr
+	var iovs [sendBufSlots]unix.Iovec
+	var rawAddrs [sendBufSlots][28]byte
+	var addrLens [sendBufSlots]uint32
+
+	lastValid := 0
+	for i := range n {
+		req := &af.sBuf.reqs[i]
+
+		iovs[i] = unix.Iovec{Base: &req.data[0], Len: uint64(len(req.data))}
+
+		if req.dst.IsValid() {
+			// Encode sockaddr for this slot.
+			addr := req.dst.Addr()
+			port := req.dst.Port()
+			if addr.Is4() {
+				rawAddrs[i][0], rawAddrs[i][1] = 2, 0
+				binary.BigEndian.PutUint16(rawAddrs[i][2:4], port)
+				a4 := addr.As4()
+				copy(rawAddrs[i][4:8], a4[:])
+				addrLens[i] = 16
+			} else {
+				rawAddrs[i][0], rawAddrs[i][1] = 10, 0
+				binary.BigEndian.PutUint16(rawAddrs[i][2:4], port)
+				a16 := addr.As16()
+				copy(rawAddrs[i][8:24], a16[:])
+				addrLens[i] = 28
+			}
+			lastValid = i
+			msgs[i] = mmsghdr{
+				hdr: unix.Msghdr{
+					Name:    &rawAddrs[i][0],
+					Namelen: addrLens[i],
+					Iov:     &iovs[i],
+					Iovlen:  1,
+				},
+			}
+		} else {
+			// Same destination as a previous slot; reuse its sockaddr.
+			msgs[i] = mmsghdr{
+				hdr: unix.Msghdr{
+					Name:    &rawAddrs[lastValid][0],
+					Namelen: addrLens[lastValid],
+					Iov:     &iovs[i],
+					Iovlen:  1,
+				},
+			}
+		}
+	}
+
+	_, _, e := unix.Syscall6(
+		unix.SYS_SENDMMSG,
+		uintptr(af.fd),
+		uintptr(unsafe.Pointer(&msgs[0])),
+		uintptr(n),
+		0, 0, 0,
+	)
+	if e != 0 {
+		log.Debugf("[sendmmsg] flush error: %v", e)
+	}
+
+	// Free data buffers.
+	for i := range n {
+		pool.PutBuffer(af.sBuf.reqs[i].data)
+		af.sBuf.reqs[i].data = nil
+	}
+	af.sBuf.count = 0
+}
+
+func (af *Anyfrom) Close() error {
+	if af.sBuf.timer != nil {
+		af.sBuf.timer.Stop()
+		af.sBuf.timer = nil
+	}
+	if af.deadlineTimer != nil {
+		af.deadlineTimer.Stop()
+		af.deadlineTimer = nil
+	}
+	return af.UDPConn.Close()
 }
 
 func (p *AnyfromPool) Recycle(lAddr netip.AddrPort, af *Anyfrom) {
