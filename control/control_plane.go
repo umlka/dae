@@ -23,6 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -94,7 +95,7 @@ type ControlPlane struct {
 	dnsRouteCache         *common.TimeWheelCache[dnsRouteCacheKey, consts.OutboundIndex]
 	dnsRoutingResultCache *common.TimeWheelCache[netip.Addr, *bpfRoutingResult]
 
-	udpTaskPool *UdpTaskPool[netip.AddrPort, emitParam]
+	udpTaskPool *UdpTaskPool[AddrPortPair, emitParam]
 
 	bpfMapJanitor bpfMapJanitor
 
@@ -247,6 +248,7 @@ func NewControlPlane(
 	}()
 
 	common.InitMetrics()
+	startBufferPoolMetrics()
 
 	/// DialerGroups (outbounds).
 	if global.AllowInsecure {
@@ -460,7 +462,7 @@ func NewControlPlane(
 
 		dnsRouteCache:         common.NewTimeWheelCache[dnsRouteCacheKey, consts.OutboundIndex](1*time.Hour, 5*time.Second, nil),
 		dnsRoutingResultCache: common.NewTimeWheelCache[netip.Addr, *bpfRoutingResult](1*time.Hour, 5*time.Second, nil),
-		udpTaskPool:           NewUdpTaskPool[netip.AddrPort, emitParam](AddrPortHash),
+		udpTaskPool:           NewUdpTaskPool[AddrPortPair, emitParam](AddrPortPairHash),
 
 		bpfMapJanitor: newBpfMapJanitor(func() *bpfObjects { return core.bpf }),
 	}
@@ -827,8 +829,71 @@ func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
+	case "buffer":
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET method required", http.StatusMethodNotAllowed)
+			return
+		}
+		var stats pool.StatsSnapshot
+		pool.PoolStats(&stats)
+		tw := tabwriter.NewWriter(writer, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "CLASS\tGETS\tRING\tPOOL\tALLOC\tHIT%\tRING%\tOCC/MAX")
+		var (
+			totalGets, totalRing, totalPool, totalAlloc uint64
+			totalOcc, totalBytes                        int
+		)
+		active := 0
+		for i, s := range stats {
+			if s.Gets == 0 && s.Occupancy == 0 {
+				continue
+			}
+			active++
+			class := 1 << i
+			fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%d\t%.1f\t%.1f\t%d/%d\n",
+				formatClassSize(class), s.Gets, s.RingHit, s.PoolHit, s.Alloc,
+				s.HitRate()*100, s.RingHitRate()*100, s.Occupancy, s.Max)
+			totalGets += s.Gets
+			totalRing += s.RingHit
+			totalPool += s.PoolHit
+			totalAlloc += s.Alloc
+			totalOcc += s.Occupancy
+			totalBytes += s.Occupancy * class
+		}
+		if active == 0 {
+			fmt.Fprintf(writer, "no pooled buffers\n")
+			return
+		}
+		var totalHit, totalRingRate float64
+		if totalGets > 0 {
+			totalHit = float64(totalGets-totalAlloc) / float64(totalGets) * 100
+			totalRingRate = float64(totalRing) / float64(totalGets) * 100
+		}
+		fmt.Fprintf(tw, "TOTAL\t%d\t%d\t%d\t%d\t%.1f\t%.1f\t%d\n",
+			totalGets, totalRing, totalPool, totalAlloc, totalHit, totalRingRate, totalOcc)
+		tw.Flush()
+		fmt.Fprintf(writer, "retained: %d buffers, %s\n", totalOcc, formatBytes(totalBytes))
 	default:
 		http.NotFound(w, r)
+	}
+}
+
+// formatClassSize renders a power-of-two class size compactly (e.g. "4K", "64K").
+func formatClassSize(size int) string {
+	if size < 1<<10 {
+		return fmt.Sprintf("%dB", size)
+	}
+	return fmt.Sprintf("%dK", size>>10)
+}
+
+// formatBytes renders a byte count with a binary unit suffix.
+func formatBytes(n int) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1fMiB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1fKiB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", n)
 	}
 }
 
@@ -1112,35 +1177,57 @@ func (c *ControlPlane) loopTcp(listener *Listener) {
 }
 
 type udpRoutineParam struct {
-	buf    []byte
-	oobBuf []byte
-	src    netip.AddrPort
+	buf []byte
+	src netip.AddrPort
+	dst netip.AddrPort
+}
+
+// shouldBypassUdpOrdering reports whether a UDP packet destined to dstPort
+// should skip the per-flow ordered queue. Latency/drop-sensitive request-
+// response protocols (DNS, STUN, SIP/RTP) and QUIC (443/8443, which is
+// reorder-immune at the protocol layer) bypass ordering; all other traffic —
+// game flows in particular — is preserved in per-flow FIFO order.
+func shouldBypassUdpOrdering(dstPort uint16) bool {
+	switch dstPort {
+	case 53, 123, 3478, 443, 8443: // DNS, NTP, STUN, QUIC
+		return true
+	}
+	// VoIP media (RTP 5004-5060) and signaling (SIP 5060).
+	return dstPort >= 5004 && dstPort <= 5060
 }
 
 var udpRoutineParamPool = sync.Pool{
 	New: func() any { return &udpRoutineParam{} },
 }
 
-func obtainUdpRoutineParam(udpConn *net.UDPConn) (*udpRoutineParam, error) {
-	param := udpRoutineParamPool.Get().(*udpRoutineParam)
+func obtainUdpRoutineParam(udpConn *net.UDPConn) (param *udpRoutineParam, err error) {
+	param = udpRoutineParamPool.Get().(*udpRoutineParam)
 	param.buf = pool.GetBuffer(consts.EthernetMtu)
-	param.oobBuf = pool.GetBuffer(128)
-	n, oobn, _, src, err := udpConn.ReadMsgUDPAddrPort(param.buf, param.oobBuf)
+	oobBuf := pool.GetBuffer(128)
+	defer pool.PutBuffer(oobBuf)
+	n, oobn, _, src, err := udpConn.ReadMsgUDPAddrPort(param.buf, oobBuf)
 	if err != nil {
 		pool.PutBuffer(param.buf)
-		pool.PutBuffer(param.oobBuf)
-		udpRoutineParamPool.Put(param)
+		recycleUdpRoutineParam(param)
 		return nil, err
 	}
 	param.src = src
 	param.buf = param.buf[:n]
-	param.oobBuf = param.oobBuf[:oobn]
+	// Resolve the original destination (tproxy) up front so the caller can
+	// decide whether this flow needs ordering before handing the packet off.
+	// oobBuf is only needed for this resolution, so release it here.
+	param.dst = RetrieveOriginalDest(oobBuf[:oobn])
+	if param.dst.IsValid() {
+		param.src = common.ConvergeAddrPort(param.src)
+		param.dst = common.ConvergeAddrPort(param.dst)
+	} else {
+		log.Errorf("Invalid dst from oob: %v, cap: %d", oobBuf[:oobn], cap(oobBuf))
+	}
 	return param, nil
 }
 
 func recycleUdpRoutineParam(param *udpRoutineParam) {
 	param.buf = nil
-	param.oobBuf = nil
 	udpRoutineParamPool.Put(param)
 }
 
@@ -1160,11 +1247,29 @@ func (c *ControlPlane) loopUdp(udpConn *net.UDPConn, udpTaskChan chan *udpRoutin
 			}
 			break
 		}
-		select {
-		case udpTaskChan <- param:
-		case <-c.ctx.Done():
+		if !param.dst.IsValid() {
+			// Malformed oob: drop the packet and keep reading.
 			pool.PutBuffer(param.buf)
-			pool.PutBuffer(param.oobBuf)
+			recycleUdpRoutineParam(param)
+			continue
+		}
+		if shouldBypassUdpOrdering(param.dst.Port()) {
+			// Latency-sensitive / reorder-immune traffic (DNS, STUN, VoIP,
+			// QUIC): hand off to the unordered worker pool.
+			select {
+			case udpTaskChan <- param:
+			case <-c.ctx.Done():
+				pool.PutBuffer(param.buf)
+				recycleUdpRoutineParam(param)
+			}
+		} else {
+			// Ordering-sensitive traffic (e.g. games): emit from the serial
+			// read loop so same-(src,dst) packets enter the per-flow queue in
+			// arrival order, preserving FIFO up to handlePkt.
+			emitTask := obtainUdpEmitTask(param.src, param.dst, param.buf, c)
+			if !c.udpTaskPool.EmitTask(AddrPortPair{Src: param.src, Dst: param.dst}, emitTask) {
+				recycleUdpEmitTask(emitTask)
+			}
 			recycleUdpRoutineParam(param)
 		}
 	}
@@ -1192,16 +1297,8 @@ func (c *ControlPlane) startUdpWorkers(workerCount int) chan *udpRoutineParam {
 
 func (c *ControlPlane) udpRoutine(param *udpRoutineParam) {
 	defer recycleUdpRoutineParam(param)
-	dst := RetrieveOriginalDest(param.oobBuf)
-	if !dst.IsValid() {
-		log.Errorf("Invalid dst from oob: %v, cap: %d", param.oobBuf, cap(param.oobBuf))
-		pool.PutBuffer(param.oobBuf)
-		pool.PutBuffer(param.buf)
-		return
-	}
-	dst = common.ConvergeAddrPort(dst)
-	pool.PutBuffer(param.oobBuf)
-	src := common.ConvergeAddrPort(param.src)
+	dst := param.dst
+	src := param.src
 	data := param.buf
 	/// Handle DNS
 	// To keep consistency with kernel program, we only sniff DNS request sent to 53.
@@ -1235,16 +1332,13 @@ func (c *ControlPlane) udpRoutine(param *udpRoutineParam) {
 		}
 	}
 
-	if err := c.handlePkt(data, src, dst); err != nil {
+	// Unordered path (bypassed ordering): handle the packet directly.
+	if e := c.handlePkt(data, src, dst); e != nil && c.ctx.Err() == nil {
 		if log.IsLevelEnabled(log.ErrorLevel) {
-			log.Errorf("%+v", common.Wrap(err, "handlePkt"))
+			log.Errorf("%+v", common.Wrap(e, "handlePkt"))
 		}
 	}
-
-	// emitTask := obtainUdpEmitTask(src, dst, data, c)
-	// if !c.udpTaskPool.EmitTask(src, emitTask) {
-	// 	recycleUdpEmitTask(emitTask)
-	// }
+	pool.PutBuffer(data)
 }
 
 type emitParam struct {
