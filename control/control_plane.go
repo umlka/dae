@@ -249,6 +249,10 @@ func NewControlPlane(
 
 	common.InitMetrics()
 	startBufferPoolMetrics()
+	if os.Getenv("DAE_BUFFER_TRACK_STACK") == "1" {
+		pool.EnableTrackingStack.Store(true)
+		log.Warnln("Buffer pool stack tracking enabled (DAE_BUFFER_TRACK_STACK=1). This records a stack on every GetBuffer/PutBuffer and is for leak diagnosis only.")
+	}
 
 	/// DialerGroups (outbounds).
 	if global.AllowInsecure {
@@ -834,13 +838,17 @@ func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "GET method required", http.StatusMethodNotAllowed)
 			return
 		}
+		if len(params) > 0 {
+			showBufferTraces(writer, params[0])
+			return
+		}
 		var stats pool.StatsSnapshot
 		pool.PoolStats(&stats)
 		tw := tabwriter.NewWriter(writer, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "CLASS\tGETS\tRING\tPOOL\tALLOC\tHIT%\tRING%\tOCC/MAX")
+		fmt.Fprintln(tw, "CLASS\tGETS\tPUTS\tRING\tPOOL\tALLOC\tDEMOTE\tHIT%\tRING%\tOCC/MAX")
 		var (
-			totalGets, totalRing, totalPool, totalAlloc uint64
-			totalOcc, totalBytes                        int
+			totalGets, totalPuts, totalRing, totalPool, totalAlloc, totalDemoted uint64
+			totalOcc, totalBytes                                                 int
 		)
 		active := 0
 		for i, s := range stats {
@@ -849,13 +857,15 @@ func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			active++
 			class := 1 << i
-			fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%d\t%.1f\t%.1f\t%d/%d\n",
-				formatClassSize(class), s.Gets, s.RingHit, s.PoolHit, s.Alloc,
+			fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%.1f\t%.1f\t%d/%d\n",
+				formatClassSize(class), s.Gets, s.Puts, s.RingHit, s.PoolHit, s.Alloc, s.Demoted,
 				s.HitRate()*100, s.RingHitRate()*100, s.Occupancy, s.Max)
 			totalGets += s.Gets
+			totalPuts += s.Puts
 			totalRing += s.RingHit
 			totalPool += s.PoolHit
 			totalAlloc += s.Alloc
+			totalDemoted += s.Demoted
 			totalOcc += s.Occupancy
 			totalBytes += s.Occupancy * class
 		}
@@ -868,8 +878,8 @@ func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			totalHit = float64(totalGets-totalAlloc) / float64(totalGets) * 100
 			totalRingRate = float64(totalRing) / float64(totalGets) * 100
 		}
-		fmt.Fprintf(tw, "TOTAL\t%d\t%d\t%d\t%d\t%.1f\t%.1f\t%d\n",
-			totalGets, totalRing, totalPool, totalAlloc, totalHit, totalRingRate, totalOcc)
+		fmt.Fprintf(tw, "TOTAL\t%d\t%d\t%d\t%d\t%d\t%d\t%.1f\t%.1f\t%d\n",
+			totalGets, totalPuts, totalRing, totalPool, totalAlloc, totalDemoted, totalHit, totalRingRate, totalOcc)
 		tw.Flush()
 		fmt.Fprintf(writer, "retained: %d buffers, %s\n", totalOcc, formatBytes(totalBytes))
 	default:
@@ -895,6 +905,83 @@ func formatBytes(n int) string {
 	default:
 		return fmt.Sprintf("%dB", n)
 	}
+}
+
+// parseClassSize parses a compact class size like "1K", "4K", "512B" or "256"
+// into a byte count.
+func parseClassSize(s string) (int, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+	mult := 1
+	upper := strings.ToUpper(s)
+	switch {
+	case strings.HasSuffix(upper, "K"):
+		mult = 1 << 10
+		s = s[:len(s)-1]
+	case strings.HasSuffix(upper, "B"):
+		s = s[:len(s)-1]
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n * mult, true
+}
+
+// showBufferTraces writes the leaked-buffer caller stacks for one size class,
+// as reported by pool.PoolStackTrace. Requires pool.EnableTrackingStack to have
+// been set while the buffers were acquired.
+func showBufferTraces(w io.Writer, class string) {
+	size, ok := parseClassSize(class)
+	if !ok {
+		fmt.Fprintf(w, "invalid class: %q\n", class)
+		return
+	}
+	gets, puts := pool.PoolStackTrace(size)
+	if len(gets) == 0 && len(puts) == 0 {
+		fmt.Fprintf(w, "no tracked buffers for class %s (tracking off or none recorded)\n", formatClassSize(size))
+		return
+	}
+	left := traceColumn("GET", gets)
+	right := traceColumn("PUT", puts)
+	width := 0
+	for _, l := range left {
+		if len(l) > width {
+			width = len(l)
+		}
+	}
+	for i := 0; i < max(len(left), len(right)); i++ {
+		var l, r string
+		if i < len(left) {
+			l = left[i]
+		}
+		if i < len(right) {
+			r = right[i]
+		}
+		if r == "" {
+			fmt.Fprintf(w, "%s\n", l)
+		} else {
+			fmt.Fprintf(w, "%-*s  %s\n", width, l, r)
+		}
+	}
+}
+
+// traceColumn renders one list of caller stacks as lines: a header, then each
+// entry's count followed by its indented stack frames.
+func traceColumn(header string, entries []pool.StackTraceEntry) []string {
+	lines := []string{header}
+	if len(entries) == 0 {
+		return append(lines, "(none)")
+	}
+	for _, e := range entries {
+		lines = append(lines, fmt.Sprintf("%d x", e.Count))
+		for _, frame := range strings.Split(e.Stack, "\n") {
+			lines = append(lines, "  "+frame)
+		}
+	}
+	return lines
 }
 
 // parseStaticEntry parses body content into config.DnsStaticEntry.
