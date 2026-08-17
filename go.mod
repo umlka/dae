@@ -106,15 +106,15 @@ require (
 
 //replace github.com/daeuniverse/outbound => ../outbound_ppdn
 
-replace github.com/daeuniverse/outbound => github.com/ppdragon16/outbound v0.0.0-next.utls.7
+replace github.com/daeuniverse/outbound => github.com/ppdragon16/outbound v0.0.0-next.utls.11
 
 //replace github.com/daeuniverse/quic-go => ../quic-go
 
-replace github.com/daeuniverse/quic-go => github.com/ppdragon16/quic-go v0.0.0-next.utls.2
+replace github.com/daeuniverse/quic-go => github.com/ppdragon16/quic-go v0.0.0-next.utls.4
 
 //replace github.com/refraction-networking/utls => ../utls_ppdn
 
-replace github.com/refraction-networking/utls => github.com/ppdragon16/utls v1.8.2-pooled.11
+replace github.com/refraction-networking/utls => github.com/ppdragon16/utls v1.8.2-pooled.12
 
 //replace github.com/cilium/ebpf => /home/mzz/goProjects/ebpf
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
