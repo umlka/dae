@@ -48,6 +48,12 @@ type controlPlaneCore struct {
 	domainStates  map[netip.Addr]*domainState
 	domainStateMu sync.Mutex
 
+	// domainBitLength is the number of rule-index slots a domainState.matched
+	// slice needs (max domain rule index + 1). Set from the routing matcher
+	// once it is built; sized lazily per domainState so a small config does
+	// not waste ~4KB per IP.
+	domainBitLength int
+
 	closed context.Context
 	close  context.CancelFunc
 	ifmgr  *component.InterfaceManager
@@ -670,19 +676,33 @@ func setBit(bitmap []uint32, index int) {
 // struct and pushes them to the kernel, so user space and BPF stay in sync.
 type domainState struct {
 	// matched[i] = number of currently cached domains for this IP whose
-	// match bitmap has rule i set.
-	matched [consts.MaxMatchSetLen]uint32
+	// match bitmap has rule i set. Sized to the highest domain rule index
+	// (+1) actually used by the config; see controlPlaneCore.domainBitLength.
+	matched []uint32
 	// total = number of currently cached domains for this IP.
 	total uint32
 }
 
-var domainStatePool = sync.Pool{
-	New: func() any {
-		return &domainState{}
-	},
+// add applies a domain's match bitmap to the per-IP state. An all-zero bitmap
+// still increments total (it does not touch matched), which is what keeps the
+// domain_routing_map invariant (matched[i] == total) correct.
+func (s *domainState) add(bitmap *[32]uint32) {
+	s.total++
+	for i := range s.matched {
+		s.matched[i] += getBit(bitmap[:], i)
+	}
 }
 
-// flushDomainState pushes the bitmaps derived from s to the eBPF maps for ip.
+// remove undoes add for the same bitmap.
+func (s *domainState) remove(bitmap *[32]uint32) {
+	s.total--
+	for i := range s.matched {
+		s.matched[i] -= getBit(bitmap[:], i)
+	}
+}
+
+// computeDomainBitmaps derives the two eBPF bitmaps from the per-IP domain
+// state s.
 //
 // Invariants exposed to BPF:
 //
@@ -690,20 +710,30 @@ var domainStatePool = sync.Pool{
 //	                                                           // domain matches
 //	domain_routing_map[ip] bit i = (matched[i] == total)       // all cached
 //	                                                           // domains match
-func (c *controlPlaneCore) flushDomainState(ip netip.Addr, s *domainState) error {
-	var bump, routing bpfDomainRouting
+//
+// matched[i] counts the cached domains for this IP whose match bitmap has rule
+// i set; total counts ALL cached domains for this IP (including those whose
+// bitmap is entirely zero). The routing bit therefore requires every cached
+// domain to match rule i — a single non-matching domain clears it.
+func computeDomainBitmaps(s *domainState) (bump, routing bpfDomainRouting) {
 	if consts.MaxMatchSetLen/32 != len(bump.Bitmap) {
 		panic("domain bitmap length not sync with kern program")
 	}
-	for i := uint32(0); i < uint32(consts.MaxMatchSetLen); i++ {
+	for i := range s.matched {
 		if s.matched[i] == 0 {
 			continue
 		}
-		setBit(bump.Bitmap[:], int(i))
+		setBit(bump.Bitmap[:], i)
 		if s.matched[i] == s.total {
-			setBit(routing.Bitmap[:], int(i))
+			setBit(routing.Bitmap[:], i)
 		}
 	}
+	return bump, routing
+}
+
+// flushDomainState pushes the bitmaps derived from s to the eBPF maps for ip.
+func (c *controlPlaneCore) flushDomainState(ip netip.Addr, s *domainState) error {
+	bump, routing := computeDomainBitmaps(s)
 
 	ip6 := ip.As16()
 	key := common.Ipv6ByteSliceToUint32Array(ip6[:])
@@ -726,6 +756,21 @@ func (c *controlPlaneCore) deleteDomainState(ip netip.Addr) error {
 	return nil
 }
 
+// ClearDomainStates removes every (ip, bitmap) entry from the eBPF maps and
+// drops the domainState structs. Used to rebuild the domain state from
+// scratch (e.g. on routing reload).
+func (c *controlPlaneCore) ClearDomainStates() error {
+	c.domainStateMu.Lock()
+	defer c.domainStateMu.Unlock()
+	for ip := range c.domainStates {
+		if err := c.deleteDomainState(ip); err != nil {
+			return err
+		}
+	}
+	c.domainStates = make(map[netip.Addr]*domainState)
+	return nil
+}
+
 // BatchNewDomain registers a new (ip, domain) mapping discovered via DNS.
 // domainBitmap describes which routing rules the domain matches.
 func (c *controlPlaneCore) BatchNewDomain(ip netip.Addr, domainBitmap *[32]uint32) error {
@@ -734,14 +779,22 @@ func (c *controlPlaneCore) BatchNewDomain(ip netip.Addr, domainBitmap *[32]uint3
 
 	s, ok := c.domainStates[ip]
 	if !ok {
-		s = domainStatePool.Get().(*domainState)
+		s = c.newDomainState()
 		c.domainStates[ip] = s
 	}
-	s.total++
-	for i := 0; i < consts.MaxMatchSetLen; i++ {
-		s.matched[i] += getBit(domainBitmap[:], i)
-	}
+	s.add(domainBitmap)
 	return c.flushDomainState(ip, s)
+}
+
+// newDomainState allocates a domainState with its matched slice sized to the
+// current domainBitLength. domainState entries live as long as the IP stays
+// cached (min_sniffing_ttl), so no pooling is needed.
+func (c *controlPlaneCore) newDomainState() *domainState {
+	n := c.domainBitLength
+	if n < 1 {
+		n = 1
+	}
+	return &domainState{matched: make([]uint32, n)}
 }
 
 // BatchRemoveDomain unregisters a previously registered (ip, domain) mapping.
@@ -756,14 +809,9 @@ func (c *controlPlaneCore) BatchRemoveDomain(ip netip.Addr, domainBitmap *[32]ui
 	if !ok {
 		return nil
 	}
-	s.total--
-	for i := 0; i < consts.MaxMatchSetLen; i++ {
-		s.matched[i] -= getBit(domainBitmap[:], i)
-	}
+	s.remove(domainBitmap)
 	if s.total == 0 {
 		delete(c.domainStates, ip)
-		*s = domainState{}
-		domainStatePool.Put(s)
 		return c.deleteDomainState(ip)
 	}
 	return c.flushDomainState(ip, s)

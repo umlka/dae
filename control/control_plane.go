@@ -437,6 +437,7 @@ func NewControlPlane(
 	if err != nil {
 		return nil, common.Errf("RoutingMatcherBuilder.BuildUserspace: %w", err)
 	}
+	core.domainBitLength = builder.DomainBitLength()
 
 	// Release temporary allocations from rule processing to avoid memory spike.
 	runtime.GC()
@@ -528,6 +529,9 @@ func NewControlPlane(
 				return common.Wrap(err, "BatchRemoveDomain")
 			}
 			return nil
+		},
+		ClearLookupCache: func() error {
+			return core.ClearDomainStates()
 		},
 		BestDialerChooser: plane.chooseBestDnsDialer,
 		IpVersionPrefer:   dnsConfig.IpVersionPrefer,
@@ -2045,6 +2049,9 @@ func (c *ControlPlane) UpdateDns() error {
 			}
 			return nil
 		},
+		ClearLookupCache: func() error {
+			return c.core.ClearDomainStates()
+		},
 		BestDialerChooser: c.chooseBestDnsDialer,
 		IpVersionPrefer:   dnsCfg.IpVersionPrefer,
 		FixedDomainTtl:    fixedDomainTtl,
@@ -2144,6 +2151,7 @@ func (c *ControlPlane) UpdateRouting() error {
 	if err != nil {
 		return fmt.Errorf("BuildUserspace: %w", err)
 	}
+	c.core.domainBitLength = builder.DomainBitLength()
 
 	// Phase 3: Build kernel space — overwrites RoutingMap + LpmArrayMap
 	// + RoutingMetaMap in-place inside the shared BPF object. Existing
@@ -2154,7 +2162,11 @@ func (c *ControlPlane) UpdateRouting() error {
 	}
 
 	// Phase 4: Atomic swap of userspace routing matcher.
+	oldRoutingMatcher := c.routingMatcher
 	c.routingMatcher = newRoutingMatcher
+	if oldRoutingMatcher != nil {
+		oldRoutingMatcher.Release()
+	}
 
 	// Phase 5: Replay DNS domain bitmaps through the new matcher.
 	// The MatchBitmap callback reads c.routingMatcher dynamically, so
