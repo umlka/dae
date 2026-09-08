@@ -156,7 +156,7 @@ func Run(conf *config.Config, externGeoDataDirs []string) {
 	var listener *control.Listener
 	sigs := make(chan os.Signal, 1)
 	errCh := make(chan error, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGKILL, syscall.SIGILL, syscall.SIGUSR1, syscall.SIGUSR2)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGILL, syscall.SIGUSR1, syscall.SIGUSR2)
 	go func() {
 		readyChan := make(chan bool, 1)
 		go func() {
@@ -461,7 +461,7 @@ func startCommandServer(port uint16, handler http.Handler) {
 	go commandServer.ListenAndServe()
 }
 
-func newControlPlane(bpf interface{}, conf *config.Config, externGeoDataDirs []string) (c *control.ControlPlane, err error) {
+func newControlPlane(bpf any, conf *config.Config, externGeoDataDirs []string) (c *control.ControlPlane, err error) {
 	// Deep copy to prevent modification.
 	conf = deepcopy.Copy(conf).(*config.Config)
 

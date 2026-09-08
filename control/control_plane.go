@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -120,7 +121,7 @@ type ControlPlane struct {
 // TODO: Hy2 的 mark 支持
 // TODO: HandlePkt HandleConn 分割 Route 和 Dial
 func NewControlPlane(
-	_bpf interface{},
+	_bpf any,
 	tagToNodeList map[string][]string,
 	groups []config.Group,
 	routingA *config.Routing,
@@ -213,8 +214,8 @@ func NewControlPlane(
 	}
 	var bpf *bpfState
 	if _bpf != nil {
-		if _bpf, ok := _bpf.(*bpfState); ok {
-			bpf = _bpf
+		if s, ok := _bpf.(*bpfState); ok {
+			bpf = s
 		} else {
 			return nil, common.Errf("unexpected bpf type: %T", _bpf)
 		}
@@ -1058,7 +1059,7 @@ func traceColumn(header string, entries []pool.StackTraceEntry) []string {
 	}
 	for _, e := range entries {
 		lines = append(lines, fmt.Sprintf("%d x", e.Count))
-		for _, frame := range strings.Split(e.Stack, "\n") {
+		for frame := range strings.SplitSeq(e.Stack, "\n") {
 			lines = append(lines, "  "+frame)
 		}
 	}
@@ -1073,8 +1074,8 @@ func traceColumn(header string, entries []pool.StackTraceEntry) []string {
 //	ttl: 60
 func parseStaticEntry(body string) (*config.DnsStaticEntry, error) {
 	entry := &config.DnsStaticEntry{}
-	lines := strings.Split(body, "\n")
-	for _, line := range lines {
+	lines := strings.SplitSeq(body, "\n")
+	for line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -1447,20 +1448,20 @@ func (c *ControlPlane) loopUdp(udpConn *net.UDPConn, udpTaskChan chan *udpRoutin
 
 func (c *ControlPlane) startUdpWorkers(workerCount int) chan *udpRoutineParam {
 	udpTaskChan := make(chan *udpRoutineParam, 10240)
-	for i := 0; i < workerCount; i++ {
-		go func() {
+	for range workerCount {
+		go func(cp *ControlPlane, ch chan *udpRoutineParam) {
 			for {
 				select {
-				case <-c.ctx.Done():
+				case <-cp.ctx.Done():
 					return
-				case p, ok := <-udpTaskChan:
+				case p, ok := <-ch:
 					if !ok {
 						return
 					}
-					c.udpRoutine(p)
+					cp.udpRoutine(p)
 				}
 			}
-		}()
+		}(c, udpTaskChan)
 	}
 	return udpTaskChan
 }
@@ -2209,8 +2210,8 @@ func (c *ControlPlane) Close() (err error) {
 	c.bpfMapJanitor.Stop()
 
 	// Invoke defer funcs in reverse order.
-	for i := len(c.deferFuncs) - 1; i >= 0; i-- {
-		if e := c.deferFuncs[i](); e != nil {
+	for _, v := range slices.Backward(c.deferFuncs) {
+		if e := v(); e != nil {
 			// Combine errors.
 			if err != nil {
 				err = common.Errf("%w; %v", err, e)

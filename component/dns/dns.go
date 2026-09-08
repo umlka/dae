@@ -7,6 +7,7 @@ package dns
 
 import (
 	"fmt"
+	"maps"
 	"net/netip"
 	"net/url"
 	"strings"
@@ -131,11 +132,11 @@ func New(dns *config.Dns, opt *NewOption, outboundName2Id map[string]uint8) (s *
 				subIdx, exists := upstreamName2Id[subName]
 				if !exists {
 					if rawURL, ok = predefinedUpstreamNames[subName]; !ok {
-						return nil, fmt.Errorf("Undefined upstream name %q in race()", subName)
+						return nil, fmt.Errorf("undefined upstream name %q in race()", subName)
 					}
 					subIdx = uint8(len(s.upstream))
 					if currentUpstreamIndex := len(s.upstream); currentUpstreamIndex >= int(consts.OutboundUserDefinedMax) {
-						return nil, fmt.Errorf("Too many upstreams")
+						return nil, fmt.Errorf("too many upstreams")
 					}
 					r := &UpstreamResolver{
 						Raw:     rawURL,
@@ -163,7 +164,7 @@ func New(dns *config.Dns, opt *NewOption, outboundName2Id map[string]uint8) (s *
 			// Create a race placeholder upstream entry.
 			raceIdx := uint8(len(s.upstream))
 			if currentUpstreamIndex := len(s.upstream); currentUpstreamIndex >= int(consts.OutboundUserDefinedMax) {
-				return nil, fmt.Errorf("Too many upstreams")
+				return nil, fmt.Errorf("too many upstreams")
 			}
 			// Use a dummy URL for the race placeholder; it will never be resolved.
 			dummyURL, err := url.Parse("race://" + strings.Join(subNames, ","))
@@ -198,11 +199,11 @@ func New(dns *config.Dns, opt *NewOption, outboundName2Id map[string]uint8) (s *
 			continue
 		}
 		if rawURL, ok = predefinedUpstreamNames[urlKey]; !ok {
-			return nil, fmt.Errorf("Undefined upstream name in dns routing rules: %s", upstreamName)
+			return nil, fmt.Errorf("undefined upstream name in dns routing rules: %s", upstreamName)
 		}
 		currentUpstreamIndex := len(s.upstream)
 		if currentUpstreamIndex >= int(consts.OutboundUserDefinedMax) {
-			return nil, fmt.Errorf("Too many upstreams")
+			return nil, fmt.Errorf("too many upstreams")
 		}
 		r := &UpstreamResolver{
 			Raw:     rawURL,
@@ -337,7 +338,7 @@ func (s *Dns) UpdateStaticEntry(name string, entry *config.DnsStaticEntry) error
 		s.staticEntries[name] = entry
 		return nil
 	}
-	return fmt.Errorf("The entry '%s' doesn't exist", name)
+	return fmt.Errorf("the entry '%s' doesn't exist", name)
 }
 
 func (s *Dns) GetStaticEntries() map[string]*config.DnsStaticEntry {
@@ -345,9 +346,7 @@ func (s *Dns) GetStaticEntries() map[string]*config.DnsStaticEntry {
 	defer s.staticEntriesMu.RUnlock()
 	// Return a copy to avoid race conditions
 	result := make(map[string]*config.DnsStaticEntry, len(s.staticEntries))
-	for k, v := range s.staticEntries {
-		result[k] = v
-	}
+	maps.Copy(result, s.staticEntries)
 	return result
 }
 

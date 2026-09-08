@@ -246,7 +246,7 @@ func dnsDomain(data []byte, startOffset int) (qname string, nextOff int, err err
 			return "", 0, errors.New("qname length exceeds buffer size")
 		}
 
-		for i := 0; i < length; i++ {
+		for i := range length {
 			char := data[off+i]
 			if char >= 'A' && char <= 'Z' {
 				char += 'a' - 'A'
@@ -378,11 +378,7 @@ func isDnsResponseValid(resp []byte) bool {
 	// 4. 检查 Answer 数量 (ANCOUNT) 是否 > 0
 	// 偏移量 6-7 字节
 	anCount := binary.BigEndian.Uint16(resp[6:8])
-	if anCount == 0 {
-		return false
-	}
-
-	return true
+	return anCount != 0
 }
 
 func dnsAnswers(data []byte) (ips []netip.Addr, minTTL uint32) {
@@ -441,7 +437,7 @@ func newDNSRRIterator(data []byte) (dnsRRIterator, bool) {
 
 	// 1. 跳过 Question 区
 	off := 12
-	for i := 0; i < qdCount; i++ {
+	for range qdCount {
 		nextOff, err := dnsSkipDomain(data, off)
 		if err != nil {
 			return dnsRRIterator{}, false

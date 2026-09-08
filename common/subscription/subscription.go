@@ -52,8 +52,8 @@ func ResolveSubscriptionAsBase64(b []byte) (nodes []string) {
 	}
 
 	// Simply check and preprocess.
-	lines := strings.Split(raw, "\n")
-	for _, line := range lines {
+	lines := strings.SplitSeq(raw, "\n")
+	for line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -151,9 +151,7 @@ func ResolveFile(u *url.URL, configDir string) (b []byte, err error) {
 // tag->nodeList mapping. Manual nodes are added under the empty tag "".
 func ResolveAllSubscriptions(client *http.Client, subscriptionDir string, nodes []string, subscriptions []string) (tagToNodeList map[string][]string) {
 	tagToNodeList = make(map[string][]string)
-	for _, node := range nodes {
-		tagToNodeList[""] = append(tagToNodeList[""], node)
-	}
+	tagToNodeList[""] = append(tagToNodeList[""], nodes...)
 	for _, sub := range subscriptions {
 		tag, nodes, err := ResolveSubscription(client, subscriptionDir, sub)
 		if err != nil {
