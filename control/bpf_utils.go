@@ -18,6 +18,8 @@ import (
 	"sync"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/features"
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/consts"
 	internal "github.com/daeuniverse/dae/pkg/ebpf_internal"
@@ -238,6 +240,7 @@ func (p bpfIfParams) CheckVersionRequirement(version *internal.Version) (err err
 type loadBpfOptions struct {
 	PinPath             string
 	BigEndianTproxyPort uint32
+	TproxyReuseport     uint8
 	CollectionOptions   *ebpf.CollectionOptions
 	KernelVersion       *internal.Version
 }
@@ -262,6 +265,13 @@ retryLoadBpf:
 	if err != nil {
 		return fmt.Errorf("failed to get netns id: %w", err)
 	}
+	hasBpfGetCurrentTask := uint8(0)
+	if err := features.HaveProgramHelper(ebpf.CGroupSockAddr, asm.FnGetCurrentTask); err == nil {
+		hasBpfGetCurrentTask = 1
+		log.Debugf("bpf_get_current_task is supported")
+	} else {
+		log.Warnf("Kernel does not support bpf_get_current_task helper: %v; process names may be truncated or less accurate (degraded to bpf_get_current_comm)", err)
+	}
 	constants := map[string]any{
 		"PARAM": struct {
 			tproxyPort           uint32
@@ -272,7 +282,8 @@ retryLoadBpf:
 			paddingAfterMac      [2]byte
 			useRedirectPeer      uint8
 			hasBpfGetCurrentTask uint8
-			padding2             uint16
+			tproxyReuseport      uint8
+			padding2             uint8
 			daeSocketMark        uint32
 		}{
 			tproxyPort:      uint32(opts.BigEndianTproxyPort),
@@ -287,7 +298,8 @@ retryLoadBpf:
 				}
 				return 0
 			}(),
-			hasBpfGetCurrentTask: 1,
+			hasBpfGetCurrentTask: hasBpfGetCurrentTask,
+			tproxyReuseport:      opts.TproxyReuseport,
 			padding2:             0,
 			daeSocketMark:        0,
 		},
