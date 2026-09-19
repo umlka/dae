@@ -404,32 +404,61 @@ func (d *Dialer) runCheckLoop(checkOpt *CheckOption) {
 		case <-done:
 			return
 		case <-d.checkCh:
-			didUpdate := false
+			// Phase 1: reconnect. A dialer that is not alive (the previous
+			// cycle marked it so) gets its own reconnect budget here, before
+			// any probing — the check-retry loop below is for riding out
+			// transient probe blips, not for rebuilding connections. A
+			// dialer that cannot reconnect is dead for real: land the flip
+			// immediately and wait for the next ticker tick.
+			var lastErr error
+			if !d.Alive() {
+				d.NotifyStatusChange()
+				reconnected := false
+				for i := range RetryCount {
+					if i > 0 {
+						time.Sleep(RetryInterval)
+					}
+					if lastErr = d.connectOnce(); lastErr == nil {
+						reconnected = true
+						break
+					}
+				}
+				if !reconnected {
+					d.Update(false, 0, checkOpt.networkType,
+						common.Errf("reconnect failed after %d retries: %v", RetryCount, lastErr))
+					// Cleanup channel to avoid consecutive checks.
+					select {
+					case <-d.checkCh:
+					default:
+					}
+					continue
+				}
+			}
+			// Phase 2: check retries. Probes only, no reconnecting. A failed
+			// attempt must NOT flip the dialer not-alive while retries
+			// remain: the retry loop exists to ride out transient blips, and
+			// an eager flip (the old behavior) defeated that — a single lost
+			// probe flipped the eBPF connectivity map and downgraded the
+			// whole group's flows for one interval. Failed attempts are
+			// therefore only accumulated here; Update(false) lands once
+			// after the loop is exhausted. Success lands immediately:
+			// recovery should propagate ASAP.
+			checkPassed := false
 			for i := range RetryCount {
 				if i > 0 {
 					time.Sleep(RetryInterval)
 				}
-				if !d.Alive() {
-					d.NotifyStatusChange()
-					if err := d.connectOnce(); err != nil {
-						// Dialer is already dead and reconnect failed;
-						// no point retrying within this cycle — wait for
-						// the next ticker tick.
-						d.Update(false, 0, checkOpt.networkType, err)
-						didUpdate = true
-						break
-					}
-				}
 				ok, latency, err := d.Check(checkOpt)
-				d.Update(ok, latency, checkOpt.networkType, err)
-				didUpdate = true
 				if ok {
+					d.Update(ok, latency, checkOpt.networkType, err)
+					checkPassed = true
 					break
 				}
+				lastErr = err
 			}
-			if !didUpdate {
+			if !checkPassed {
 				d.Update(false, 0, checkOpt.networkType,
-					common.Errf("connect failed after %d retries", RetryCount))
+					common.Errf("check failed after %d retries: %v", RetryCount, lastErr))
 			}
 			// Cleanup channel to avoid consecutive checks.
 			select {
@@ -656,9 +685,63 @@ func (d *Dialer) Update(ok bool, latency time.Duration, networkType *common.Netw
 	d.notifyStatusChangeLocked()
 	d.mu.Unlock()
 
-	// Dialer just became not alive; abort all connections.
+	// alive -> not alive no longer aborts immediately: arm a deferred abort
+	// that fires one CheckInterval later unless a recovery cancels it (see
+	// scheduleAbortConns). Any successful check disarms the timer, so a
+	// single flapped check round never kills the connections whose tunnels
+	// are actually still up.
 	if oldAlive && !ok {
+		d.scheduleAbortConns()
+	}
+	if ok {
+		d.cancelAbortConns()
+	}
+}
+
+// scheduleAbortConns arms the deferred AbortConns: a full CheckInterval must
+// pass with the dialer still not alive — i.e. two consecutive check rounds
+// failed — before the connections through it are killed. A node that flaps
+// briefly and recovers within the window cancels the timer and its live
+// connections survive. Retries must not stack timers: an armed timer is
+// left alone. A dialer with no CheckInterval configured keeps the legacy
+// immediate-abort behavior.
+func (d *Dialer) scheduleAbortConns() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.abortConnsTimer != nil {
+		return // already armed
+	}
+	if d.CheckInterval <= 0 {
 		d.AbortConns()
+		return
+	}
+	d.abortConnsTimer = time.AfterFunc(d.CheckInterval, d.abortConnsTimerFired)
+}
+
+// abortConnsTimerFired runs one CheckInterval after the first failed check.
+// The alive re-check guards the race where recovery landed between the last
+// check tick and the fire.
+func (d *Dialer) abortConnsTimerFired() {
+	d.mu.Lock()
+	d.abortConnsTimer = nil
+	d.mu.Unlock()
+	if d.alive.Load() {
+		return
+	}
+	log.WithFields(log.Fields{
+		"node":  d.Name,
+		"after": d.CheckInterval,
+	}).Warnln("Dialer still not alive after two consecutive check failures; aborting its connections")
+	d.AbortConns()
+}
+
+// cancelAbortConns disarms a pending deferred abort (the dialer recovered).
+func (d *Dialer) cancelAbortConns() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.abortConnsTimer != nil {
+		d.abortConnsTimer.Stop()
+		d.abortConnsTimer = nil
 	}
 }
 
