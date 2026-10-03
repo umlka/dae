@@ -756,9 +756,33 @@ func (c *DnsController) handleDNSRequestRace(
 	ch := make(chan result, len(raceUpstreams))
 
 	for _, upstream := range raceUpstreams {
-		go func(upstream *dns.Upstream) {
+		// Snapshot the request BEFORE spawning: this function returns as soon as
+		// the first winner is known, but the losing goroutines keep running
+		// until their upstream answers or their attempt deadline expires. As
+		// soon as Handle returns, udpRoutine recycles the request buffer and
+		// the *dnsRequest (pool.PutBuffer / RecycleDnsRequest), and the recycled
+		// memory is immediately handed to the next DNS packet. Taking the copy
+		// inside the goroutine would not be safe: the goroutine may not be
+		// scheduled until after that reuse, so it would still read - and send
+		// upstream - whatever foreign query now occupies the buffer, and its
+		// answer would be filed under this query's cache key. Copying here, in
+		// the synchronously executed loop body, happens-before any recycling.
+		// The copy of the request struct comes from the pool rather than a
+		// local `reqCopy := *req`: handleDNSRequestByUpstream (and the helpers
+		// it passes req to) leak the pointer, so an address-taken local would
+		// be moved to the heap on every race, for every upstream. Pooling keeps
+		// the steady state allocation-free.
+		dataCopy := pool.GetBuffer(len(data))
+		copy(dataCopy, data)
+		reqCopy := ObtainDnsRequest(req.Src, req.Dst, req.routingResult, req.isTcp)
+		go func(upstream *dns.Upstream, dataCopy []byte, reqCopy *dnsRequest) {
+			defer func() {
+				pool.PutBuffer(dataCopy)
+				RecycleDnsRequest(reqCopy)
+			}()
+
 			localResp := dnsResponseDataPool.Get().(*dnsResponseData)
-			err := c.handleDNSRequestByUpstream(data, req, queryInfo, upstream, localResp)
+			err := c.handleDNSRequestByUpstream(dataCopy, reqCopy, queryInfo, upstream, localResp)
 			win := err == nil && winner.CompareAndSwap(false, true)
 			if win {
 				*dnsResp = *localResp
@@ -768,7 +792,7 @@ func (c *DnsController) handleDNSRequestRace(
 			*localResp = dnsResponseData{}
 			dnsResponseDataPool.Put(localResp)
 			ch <- result{err: err, win: win}
-		}(upstream)
+		}(upstream, dataCopy, reqCopy)
 	}
 
 	var firstErr error
@@ -953,17 +977,46 @@ func recycleDnsRefreshParam(p *dnsRefreshParam) {
 	dnsRefreshParamPool.Put(p)
 }
 
+// rewriteUpstreamQuery applies the raw-byte rewrites dae performs on a client
+// query before forwarding it upstream: the EDNS0 UDP payload size clamp and
+// the effective ECS policy. The input query may be shared across racing
+// dialers, so a rewrite always produces a fresh buffer and the caller's bytes
+// are never mutated. release is nil when nothing was taken from the pool;
+// otherwise it returns those buffers and must be called once the query is no
+// longer needed.
+func rewriteUpstreamQuery(data []byte, ecsSpec *dialer.EcsSpec) (out []byte, release func()) {
+	out = data
+	var pooled [][]byte
+	if clamped, changed := dnsClampUDPSize(out, dnsUDPPayloadCap); changed {
+		out = clamped
+		pooled = append(pooled, clamped)
+	}
+	if ecsSpec != nil {
+		if rewritten, changed := dnsRewriteEcs(out, ecsSpec); changed {
+			out = rewritten
+			pooled = append(pooled, rewritten)
+		}
+	}
+	if len(pooled) == 0 {
+		return out, nil
+	}
+	return out, func() {
+		for _, b := range pooled {
+			pool.PutBuffer(b)
+		}
+	}
+}
+
 func (c *DnsController) dialSend(data []byte, upstream *dns.Upstream, dialArg *dialArgument, queryInfo queryInfo, dnsResp *dnsResponseData) error {
-	// Effective EDNS0 Client Subnet policy (global dns.ecs default,
-	// overridden by the dialer's [ecs: ...] annotation): strip or
-	// rewrite before cache lookup and forwarding. The input query may be
+	// Cap the client's advertised EDNS0 UDP payload size (see
+	// dnsUDPPayloadCap) and apply the effective EDNS0 Client Subnet policy
+	// (global dns.ecs default, overridden by the dialer's [ecs: ...]
+	// annotation) before cache lookup and forwarding. The input query may be
 	// shared across racing dialers, so a rewrite always produces a fresh
 	// buffer; the caller's bytes are never mutated.
-	if spec := c.resolveEcsPolicy(dialArg.Outbound, dialArg.Dialer); spec != nil {
-		if rewritten, changed := dnsRewriteEcs(data, spec); changed {
-			data = rewritten
-			defer pool.PutBuffer(rewritten)
-		}
+	data, releaseQuery := rewriteUpstreamQuery(data, c.resolveEcsPolicy(dialArg.Outbound, dialArg.Dialer))
+	if releaseQuery != nil {
+		defer releaseQuery()
 	}
 	// Lookup Cache
 	if c.enableCache {

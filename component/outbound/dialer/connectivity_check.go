@@ -24,8 +24,10 @@ import (
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/common/netutils"
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pkg/fastrand"
 	"github.com/daeuniverse/outbound/pool"
+	"github.com/daeuniverse/outbound/protocol/direct"
 	dnsmessage "github.com/miekg/dns"
 	log "github.com/sirupsen/logrus"
 )
@@ -33,6 +35,17 @@ import (
 const (
 	RetryCount    = 3
 	RetryInterval = 5 * time.Second
+
+	// initialCheckRounds bounds how many full four-network-type rounds the
+	// first activation runs before it gives up on discovering a usable
+	// network type.
+	initialCheckRounds = 3
+
+	// defaultInitialCheckRetryInterval is the pause between discovery rounds. It is
+	// a default, not a package-level knob: tests shorten it per dialer through
+	// Dialer.checkRetryInterval, which is set before the check goroutine starts and
+	// therefore needs no synchronisation.
+	defaultInitialCheckRetryInterval = 5 * time.Second
 )
 
 func (d *Dialer) Alive() bool {
@@ -101,7 +114,7 @@ func ParseTcpCheckOption(rawURL []string, method string) (opt *TcpCheckOption, e
 			return nil, common.Wrap(err, "ParseTcpCheckOption: failed to parse ip from list")
 		}
 	} else {
-		ip46, err = netutils.ParseOrResolveIp46(u.Hostname())
+		ip46, err = resolveCheckHost(u.Hostname())
 		if err != nil {
 			return nil, common.Wrap(err, "ParseTcpCheckOption: failed to resolve ip for %v", u.Hostname())
 		}
@@ -120,6 +133,38 @@ type CheckDnsOption struct {
 	DnsHost string
 	DnsPort uint16
 	netutils.Ip46
+}
+
+// checkHostResolveTimeout bounds a connectivity-check hostname lookup. The
+// lookup happens while the dialer set is being built, so an unreachable DNS
+// server must fail the check options rather than stall the caller. It is a
+// variable only so tests can shorten it.
+var checkHostResolveTimeout = 5 * time.Second
+
+// resolveCheckHost resolves a connectivity-check hostname (udp_check_dns or
+// tcp_check_url). A check address is resolved exactly like a dial to it: the
+// direct dialer's own policy, where the system DNS view is raced against the
+// configured fallback resolver and both legs carry the dae mark.
+func resolveCheckHost(host string) (netutils.Ip46, error) {
+	return resolveCheckHostWith(direct.ResolveHost, host)
+}
+
+// resolveCheckHostWith applies resolve under a bounded deadline, so a resolver
+// that never answers fails the caller that is building the dialer set. resolve
+// is a parameter rather than a package-level hook so a test can pin the
+// deadline and the failure path without mutating process state.
+func resolveCheckHostWith(resolve func(context.Context, string) ([]string, error), host string) (netutils.Ip46, error) {
+	// An address literal never needs a lookup.
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return netutils.FromAddr(addr), nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), checkHostResolveTimeout)
+	defer cancel()
+	addrs, err := resolve(ctx, host)
+	if err != nil {
+		return netutils.Ip46{}, err
+	}
+	return netutils.Ip46FromStrings(addrs), nil
 }
 
 func ParseCheckDnsOption(dnsHostPort []string) (opt *CheckDnsOption, err error) {
@@ -142,7 +187,7 @@ func ParseCheckDnsOption(dnsHostPort []string) (opt *CheckDnsOption, err error) 
 			return nil, common.Wrap(err, "ParseCheckDnsOption: failed to parse ip from list")
 		}
 	} else {
-		ip46, err = netutils.ParseOrResolveIp46(host)
+		ip46, err = resolveCheckHost(host)
 		if err != nil {
 			return nil, common.Wrap(err, "ParseCheckDnsOption: failed to resolve ip for %v", host)
 		}
@@ -189,7 +234,7 @@ func (c *CheckDnsOptionRaw) Option() (opt *CheckDnsOption, err error) {
 	if c.opt == nil {
 		udpCheckOption, err := ParseCheckDnsOption(c.Raw)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse tcp_check_url: %w", err)
+			return nil, fmt.Errorf("failed to parse udp_check_dns: %w", err)
 		}
 		c.opt = udpCheckOption
 	}
@@ -247,7 +292,16 @@ func (d *Dialer) createCheckOptions() []*CheckOption {
 	server4 := ""
 	server6 := ""
 	opt, err := d.CheckDnsOptionRaw.Option()
-	if err == nil {
+	if err != nil {
+		// Do not degrade silently: without an address every check func dials an
+		// empty server, so all four network types report down and the node looks
+		// unreachable instead of misconfigured.
+		log.WithFields(log.Fields{
+			"link":  d.CheckDnsOptionRaw.Raw,
+			"node":  d.Name,
+			"error": err,
+		}).Warnln("Failed to parse udp_check_dns; connectivity checks cannot run")
+	} else {
 		if opt.Ip4.IsValid() {
 			server4 = netip.AddrPortFrom(opt.Ip4, opt.DnsPort).String()
 		}
@@ -286,37 +340,264 @@ func (d *Dialer) ActivateCheck() {
 		return
 	}
 	d.checkActivated = true
+	// Hand the context to the goroutines instead of letting them re-read the
+	// field: ReactivateCheck swaps it, so a superseded ticker waking from its
+	// jitter sleep would otherwise adopt the new context and install a second
+	// ticker alongside the new chain's.
+	ctx := d.checkCtx
+	go d.startCheckTicker(ctx)
+	go d.runCheckLoop(ctx, d.createCheckOptions())
+}
 
-	CheckOpts := d.createCheckOptions()
+// runCheckLoop is the dialer's single check goroutine. It runs two phases and
+// returns only when the dialer's check context is cancelled:
+//
+//  1. Discovery: probe every network type until one of them passes, retrying
+//     the full round until it does. A node that is merely unreachable while the
+//     daemon starts (WAN not up yet, or its probe server momentarily blocked)
+//     therefore recovers on its own instead of staying excluded.
+//  2. Steady state: keep checking the network type that worked.
+//
+// Keeping both phases in one goroutine is what makes the lifecycle simple: an
+// earlier split (one goroutine discovering, then handing over to a second one)
+// needed a running flag, a generation counter and a handover flag to tell a
+// live chain from a vanished one, and NotifyCheck rebuilt the chain whenever
+// that bookkeeping momentarily disagreed. Here "the chain is running" is
+// simply "this goroutine has not returned".
+func (d *Dialer) runCheckLoop(ctx context.Context, checkOpts []*CheckOption) {
+	d.runCheckLoopWith(ctx, checkOpts, RetryCount, RetryInterval)
+}
 
-	go func() {
-		// at startup, check all network types to determine which are supported
-		done := d.checkCtx.Done()
+// runCheckLoopWith is runCheckLoop with an explicit probe-retry budget: a failed
+// steady-state probe is retried retryCount times, spaced by retryInterval,
+// before the dialer is judged dead for that network type and discovery runs
+// again. Tests pass a short budget instead of waiting out RetryInterval.
+func (d *Dialer) runCheckLoopWith(ctx context.Context, checkOpts []*CheckOption, retryCount int, retryInterval time.Duration) {
+	done := ctx.Done()
+	log.WithFields(log.Fields{"node": d.Name}).Infoln("Connectivity check started")
+
+	// One timer is reused by every discovery round: time.After inside the loop
+	// would allocate a fresh timer on every retry.
+	retryTimer := time.NewTimer(d.checkRetryInterval)
+	defer retryTimer.Stop()
+
+	// Discovery and steady state alternate: discovery probes every network type
+	// and picks one, steady state checks that one, and a sustained failure of it
+	// sends the loop back to discovery.
+	for {
+		// A probe is expected to return: every dialer must honour its context
+		// (netproxy.Dialer's contract). If discovery has not finished after three
+		// check intervals, say so instead of going silent — a hung probe is
+		// otherwise indistinguishable from "no check ever ran".
+		slowWarn := time.AfterFunc(3*d.CheckInterval, func() {
+			log.WithFields(log.Fields{
+				"node":   d.Name,
+				"waited": (3 * d.CheckInterval).String(),
+			}).Warnln("Connectivity check is still running: a probe may be stuck ignoring its context")
+		})
+		// Phase 1: discovery. Probe every network type until one of them passes,
+		// retrying the full round until it does — a dialer that is merely
+		// unreachable while the daemon starts (WAN not up yet, or its probe server
+		// momentarily blocked) therefore recovers on its own instead of staying
+		// excluded. Only cancellation of the dialer's context ends this phase.
 		var checkOpt *CheckOption
-		for range 3 {
-			checkOpt = d.runInitialCheck(CheckOpts)
+		for {
+			var checkErr error
+			checkOpt, checkErr = d.runInitialCheck(checkOpts)
 			if checkOpt != nil {
 				break
 			}
+			if checkErr == nil {
+				checkErr = common.Errf("no usable network type after %d initial check rounds", initialCheckRounds)
+			}
+			// runInitialCheck only calls Update for a network type that passed, so
+			// correct the liveness state explicitly; a later successful round lands
+			// Update(true) through runInitialCheck itself.
+			d.Update(false, 0, nil, checkErr)
+			log.WithFields(log.Fields{
+				"node":  d.Name,
+				"error": checkErr.Error(),
+			}).Warnln("Initial connectivity check found no usable network type; retrying the full discovery")
+			// Wait out the rest of the retry interval before the next round. The
+			// timer was armed before this round, so a round that already took longer
+			// than the interval returns here immediately instead of adding another
+			// one on top of it.
 			select {
 			case <-done:
+				slowWarn.Stop()
+				log.WithFields(log.Fields{"node": d.Name}).Infoln("Connectivity check stopped before it found a network type")
 				return
-			case <-time.After(5 * time.Second):
+			case <-retryTimer.C:
+			}
+			retryTimer.Reset(d.checkRetryInterval)
+		}
+		slowWarn.Stop()
+		log.WithFields(log.Fields{
+			"node":    d.Name,
+			"network": checkOpt.networkType.String(),
+		}).Infoln("Connectivity check entering steady state")
+
+		// Steady state: check the network type that discovery confirmed. If it
+		// stops working, leave the loop and run discovery again — that is the
+		// only way the support matrix (and noIpv6) are refreshed and the only
+		// way the dialer can come back on another network type that still works.
+		//
+		// TODO: 是否应该在每个周期也探测其它 supported 类型？好处是能在 metrics
+		// 中看到未选中类型的延迟，代价是每节点每周期最多 4 次探测。另外，udp 53能通不一定udp 443也能通。
+	steady:
+		for {
+			select {
+			case <-done:
+				log.WithFields(log.Fields{"node": d.Name}).Infoln("Steady-state check loop stopped")
+				return
+			case <-d.checkCh:
+				// Probe retries. A failed attempt must NOT flip the dialer
+				// not-alive while retries remain: the retry loop exists to ride
+				// out transient blips, and an eager flip (the old behavior)
+				// defeated that — a single lost probe flipped the eBPF
+				// connectivity map and downgraded the whole group's flows for
+				// one interval. Failed attempts are therefore only accumulated
+				// here; Update(false) lands once after the loop is exhausted.
+				// Success lands immediately: recovery should propagate ASAP.
+				checkPassed := false
+				var lastErr error
+				for i := range retryCount {
+					if i > 0 {
+						time.Sleep(retryInterval)
+					}
+					ok, latency, err := d.Check(checkOpt)
+					if ok {
+						d.Update(ok, latency, checkOpt.networkType, err)
+						checkPassed = true
+						break
+					}
+					lastErr = err
+					// A port-hopping link (hysteria2) may have lost its probe on
+					// a port that is blocked or lossy. Re-roll the endpoint port
+					// for the next attempt instead of retrying the same one; the
+					// QUIC connection is kept, so this costs no handshake.
+					if i < retryCount-1 && hopPortOnFailure(d.Dialer) && log.IsLevelEnabled(log.DebugLevel) {
+						log.WithFields(log.Fields{
+							"node": d.Name,
+						}).Debugln("Port hop after a failed check")
+					}
+				}
+				// Cleanup channel to avoid consecutive checks.
+				select {
+				case <-d.checkCh:
+				default:
+				}
+				if checkPassed {
+					continue
+				}
+				d.Update(false, 0, checkOpt.networkType,
+					common.Errf("check failed after %d retries: %v", retryCount, lastErr))
+				// The network type steady state was checking looks dead for
+				// good. Drop the latency history so the group series does not
+				// blend this type's samples with the type discovery picks next
+				// (TCP handshakes and UDP probes differ by an order of
+				// magnitude), then re-run discovery. Recovery from here is
+				// handled by discovery, which reconnects if needed before
+				// probing every network type.
+				d.ResetLatency()
+				log.WithFields(log.Fields{
+					"node":    d.Name,
+					"network": checkOpt.networkType.String(),
+					"error":   lastErr,
+				}).Warnln("Connectivity check failed; re-running discovery to refresh the supported network types")
+				break steady
 			}
 		}
-		if checkOpt == nil {
-			return
+	}
+}
+
+func (d *Dialer) runInitialCheck(checkOpts []*CheckOption) (opt *CheckOption, checkErr error) {
+	defer d.NotifyStatusChange()
+
+	d.supported.Store(0)
+
+	var wg sync.WaitGroup
+	var latency [4]time.Duration
+	var errs [4]error
+	if !d.Alive() {
+		if err := d.connectOnce(); err != nil {
+			log.WithFields(log.Fields{
+				"node": d.Name,
+			}).Errorf("Failed to connect: %v", err)
+			d.Update(false, 0, nil, err)
+			return nil, err
 		}
-		// after startup, only run check on one network type
-		select {
-		case <-done:
-			return
-		default:
+	}
+	for _, opt := range checkOpts {
+		i := common.NetworkTypeToIndex(opt.networkType)
+		wg.Go(func() {
+			ok, lat, e := d.Check(opt)
+			d.setSupportedBit(i, ok)
+			latency[i] = lat
+			errs[i] = e
+			if log.IsLevelEnabled(log.InfoLevel) {
+				if ok {
+					log.WithFields(log.Fields{
+						"network": opt.networkType.String(),
+						"node":    d.Name,
+						"last":    latency[i].Truncate(time.Millisecond).String(),
+					}).Infoln("Inital Connectivity Check")
+				} else {
+					log.WithFields(log.Fields{
+						"network": opt.networkType.String(),
+						"node":    d.Name,
+					}).Infof("Inital Connectivity Check Failed: %v\n", errs[i])
+				}
+			}
+		})
+	}
+	wg.Wait()
+	// A dialer that fails both IPv6 checks cannot proxy IPv6 traffic at all.
+	// Mark it so DNS AAAA requests through it are rejected, keeping clients
+	// on IPv4 instead of routing IPv6 to a different (IPv6-capable) node.
+	d.noIpv6.Store(
+		!d.Supported(common.NetworkTypeToIndex(common.NETWORK_TCP6)) &&
+			!d.Supported(common.NetworkTypeToIndex(common.NETWORK_UDP6)))
+	for _, opt := range checkOpts {
+		i := common.NetworkTypeToIndex(opt.networkType)
+		if ok := d.Supported(i); ok {
+			// The first pass above established the connection; for TCP+mux
+			// protocols (e.g. anytls) its latency includes the TCP+TLS
+			// handshake, which over-penalizes them against UDP/QUIC protocols
+			// (e.g. hysteria2) whose handshake is ~free. Re-check the same
+			// network type once more: the connection is now warm (reused from
+			// the dialer's session pool), so the second latency reflects the
+			// steady state and is the right seed for the moving average.
+			// Alive/support state is still taken from the first pass.
+			warmLatency, warmErr := latency[i], errs[i]
+			if ok2, lat2, err2 := d.Check(opt); ok2 {
+				warmLatency, warmErr = lat2, err2
+			} else if log.IsLevelEnabled(log.WarnLevel) {
+				log.WithFields(log.Fields{
+					"network": opt.networkType.String(),
+					"node":    d.Name,
+				}).Warnf("Inital Connectivity Check warm re-check failed: %v; falling back to cold latency", err2)
+			}
+			if log.IsLevelEnabled(log.DebugLevel) {
+				log.WithFields(log.Fields{
+					"network": opt.networkType.String(),
+					"node":    d.Name,
+					"cold":    latency[i].Truncate(time.Millisecond).String(),
+					"warm":    warmLatency.Truncate(time.Millisecond).String(),
+				}).Debugln("Inital Connectivity Check (warm re-check)")
+			}
+			d.Update(ok, warmLatency, opt.networkType, warmErr)
+			return opt, nil
 		}
-		go d.startCheckTicker()
-		// TODO: 是否应该对所有网络类型进行检查? runInitialCheck 是不是没意义了? udp 53 能通不一定 udp 443 也能通
-		go d.runCheckLoop(checkOpt)
-	}()
+	}
+	// No network type worked. Report why so the caller can correct the
+	// liveness state; prefer a real probe error over a generic one.
+	for _, opt := range checkOpts {
+		if e := errs[common.NetworkTypeToIndex(opt.networkType)]; e != nil {
+			return nil, e
+		}
+	}
+	return nil, common.Errf("no network type passed the initial connectivity check")
 }
 
 func (d *Dialer) ReactivateCheck() {
@@ -331,9 +612,15 @@ func (d *Dialer) ReactivateCheck() {
 	d.ActivateCheck()
 }
 
-func (d *Dialer) startCheckTicker() {
-	// Sleep to avoid avalanche.
-	time.Sleep(time.Duration(fastrand.Int63n(int64(d.CheckInterval))))
+func (d *Dialer) startCheckTicker(ctx context.Context) {
+	done := ctx.Done()
+	// Sleep to avoid avalanche, but stay cancellable: a superseded ticker must
+	// not wake up and install itself (and it must not adopt a newer context).
+	select {
+	case <-done:
+		return
+	case <-time.After(time.Duration(fastrand.Int63n(int64(d.CheckInterval)))):
+	}
 	d.tickerMu.Lock()
 	ticker := time.NewTicker(d.CheckInterval)
 	d.ticker = ticker
@@ -349,7 +636,6 @@ func (d *Dialer) startCheckTicker() {
 		}
 		d.tickerMu.Unlock()
 	}()
-	done := d.checkCtx.Done()
 	for {
 		select {
 		case <-done:
@@ -364,12 +650,12 @@ func (d *Dialer) startCheckTicker() {
 	}
 }
 
-// Manually start check.
+// NotifyCheck nudges the check goroutine, e.g. after a relay failed through
+// this dialer. There is nothing to re-arm: runCheckLoop returns only when the
+// dialer is stopped, so an activated dialer always has its goroutine.
 func (d *Dialer) NotifyCheck() {
-	select {
-	case <-d.checkCtx.Done():
-		return
 	// If fail to push elem to chan, the check is in process.
+	select {
 	case d.checkCh <- time.Now():
 	default:
 	}
@@ -395,160 +681,6 @@ func (d *Dialer) connectOnce() error {
 		return struct{}{}, d.Connect()
 	})
 	return err
-}
-
-func (d *Dialer) runCheckLoop(checkOpt *CheckOption) {
-	done := d.checkCtx.Done()
-	for {
-		select {
-		case <-done:
-			return
-		case <-d.checkCh:
-			// Phase 1: reconnect. A dialer that is not alive (the previous
-			// cycle marked it so) gets its own reconnect budget here, before
-			// any probing — the check-retry loop below is for riding out
-			// transient probe blips, not for rebuilding connections. A
-			// dialer that cannot reconnect is dead for real: land the flip
-			// immediately and wait for the next ticker tick.
-			var lastErr error
-			if !d.Alive() {
-				d.NotifyStatusChange()
-				reconnected := false
-				for i := range RetryCount {
-					if i > 0 {
-						time.Sleep(RetryInterval)
-					}
-					if lastErr = d.connectOnce(); lastErr == nil {
-						reconnected = true
-						break
-					}
-				}
-				if !reconnected {
-					d.Update(false, 0, checkOpt.networkType,
-						common.Errf("reconnect failed after %d retries: %v", RetryCount, lastErr))
-					// Cleanup channel to avoid consecutive checks.
-					select {
-					case <-d.checkCh:
-					default:
-					}
-					continue
-				}
-			}
-			// Phase 2: check retries. Probes only, no reconnecting. A failed
-			// attempt must NOT flip the dialer not-alive while retries
-			// remain: the retry loop exists to ride out transient blips, and
-			// an eager flip (the old behavior) defeated that — a single lost
-			// probe flipped the eBPF connectivity map and downgraded the
-			// whole group's flows for one interval. Failed attempts are
-			// therefore only accumulated here; Update(false) lands once
-			// after the loop is exhausted. Success lands immediately:
-			// recovery should propagate ASAP.
-			checkPassed := false
-			for i := range RetryCount {
-				if i > 0 {
-					time.Sleep(RetryInterval)
-				}
-				ok, latency, err := d.Check(checkOpt)
-				if ok {
-					d.Update(ok, latency, checkOpt.networkType, err)
-					checkPassed = true
-					break
-				}
-				lastErr = err
-			}
-			if !checkPassed {
-				d.Update(false, 0, checkOpt.networkType,
-					common.Errf("check failed after %d retries: %v", RetryCount, lastErr))
-			}
-			// Cleanup channel to avoid consecutive checks.
-			select {
-			case <-d.checkCh:
-			default:
-			}
-		}
-	}
-}
-
-func (d *Dialer) runInitialCheck(checkOpts []*CheckOption) (opt *CheckOption) {
-	defer d.NotifyStatusChange()
-
-	d.supported.Store(0)
-
-	var wg sync.WaitGroup
-	var latency [4]time.Duration
-	var err [4]error
-	if !d.Alive() {
-		if err := d.connectOnce(); err != nil {
-			log.WithFields(log.Fields{
-				"node": d.Name,
-			}).Errorf("Failed to connect: %v", err)
-			d.Update(false, 0, nil, err)
-			return nil
-		}
-	}
-	for _, opt := range checkOpts {
-		i := common.NetworkTypeToIndex(opt.networkType)
-		wg.Go(func() {
-			ok, lat, e := d.Check(opt)
-			d.setSupportedBit(i, ok)
-			latency[i] = lat
-			err[i] = e
-			if log.IsLevelEnabled(log.InfoLevel) {
-				if ok {
-					log.WithFields(log.Fields{
-						"network": opt.networkType.String(),
-						"node":    d.Name,
-						"last":    latency[i].Truncate(time.Millisecond).String(),
-					}).Infoln("Inital Connectivity Check")
-				} else {
-					log.WithFields(log.Fields{
-						"network": opt.networkType.String(),
-						"node":    d.Name,
-					}).Infof("Inital Connectivity Check Failed: %v\n", err[i])
-				}
-			}
-		})
-	}
-	wg.Wait()
-	// A dialer that fails both IPv6 checks cannot proxy IPv6 traffic at all.
-	// Mark it so DNS AAAA requests through it are rejected, keeping clients
-	// on IPv4 instead of routing IPv6 to a different (IPv6-capable) node.
-	d.noIpv6.Store(
-		!d.Supported(common.NetworkTypeToIndex(common.NETWORK_TCP6)) &&
-			!d.Supported(common.NetworkTypeToIndex(common.NETWORK_UDP6)))
-	for _, opt := range checkOpts {
-		i := common.NetworkTypeToIndex(opt.networkType)
-		if ok := d.Supported(i); ok {
-			// The first pass above established the connection; for TCP+mux
-			// protocols (e.g. anytls) its latency includes the TCP+TLS
-			// handshake, which over-penalizes them against UDP/QUIC protocols
-			// (e.g. hysteria2) whose handshake is ~free. Re-check the same
-			// network type once more: the connection is now warm (reused from
-			// the dialer's session pool), so the second latency reflects the
-			// steady state and is the right seed for the moving average.
-			// Alive/support state is still taken from the first pass.
-			warmLatency, warmErr := latency[i], err[i]
-			if ok2, lat2, err2 := d.Check(opt); ok2 {
-				warmLatency, warmErr = lat2, err2
-			} else if log.IsLevelEnabled(log.WarnLevel) {
-				log.WithFields(log.Fields{
-					"network": opt.networkType.String(),
-					"node":    d.Name,
-				}).Warnf("Inital Connectivity Check warm re-check failed: %v; falling back to cold latency", err2)
-			}
-			if log.IsLevelEnabled(log.DebugLevel) {
-				log.WithFields(log.Fields{
-					"network": opt.networkType.String(),
-					"node":    d.Name,
-					"cold":    latency[i].Truncate(time.Millisecond).String(),
-					"warm":    warmLatency.Truncate(time.Millisecond).String(),
-				}).Debugln("Inital Connectivity Check (warm re-check)")
-			}
-			d.Update(ok, warmLatency, opt.networkType, warmErr)
-			return opt
-		}
-	}
-	return nil
 }
 
 func (d *Dialer) RegisterDialerGroup(g DialerGroup) {
@@ -743,6 +875,24 @@ func (d *Dialer) cancelAbortConns() {
 		d.abortConnsTimer.Stop()
 		d.abortConnsTimer = nil
 	}
+}
+
+// PortHopper is implemented by dialers whose endpoint port is drawn from a
+// range (hysteria2 port hopping). HopPort re-rolls the port of the live
+// connection without reconnecting, and reports whether it did.
+type PortHopper interface {
+	HopPort() bool
+}
+
+// hopPortOnFailure re-rolls a port-hopping dialer's endpoint port after a
+// failed probe, so the retry does not land on the same port. Dialers that do
+// not hop ports, or that are not connected, report false.
+func hopPortOnFailure(dl netproxy.Dialer) bool {
+	hopper, ok := dl.(PortHopper)
+	if !ok {
+		return false
+	}
+	return hopper.HopPort()
 }
 
 func (d *Dialer) Check(opts *CheckOption) (ok bool, latency time.Duration, err error) {

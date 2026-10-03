@@ -88,7 +88,6 @@ type ControlPlane struct {
 	sniffVerifyMode    consts.SniffVerifyMode
 	udpSniffPorts      []uint16
 	tproxyPortProtect  bool
-	soMarkFromDae      uint32
 
 	trafficLogger *TrafficLogger
 
@@ -226,6 +225,7 @@ func NewControlPlane(
 			PinPath:             pinPath,
 			BigEndianTproxyPort: uint32(common.Htons(global.TproxyPort)),
 			TproxyReuseport:     global.TproxyReuseport,
+			SoMarkFromDae:       global.SoMarkFromDae,
 			CollectionOptions:   collectionOpts,
 			KernelVersion:       &kernelVersion,
 		}); err != nil {
@@ -474,7 +474,6 @@ func NewControlPlane(
 		sniffingTimeout:        sniffingTimeout,
 		udpSniffPorts:          convertUdpSniffPorts(global.UdpSniffPorts),
 		tproxyPortProtect:      global.TproxyPortProtect,
-		soMarkFromDae:          global.SoMarkFromDae,
 		trafficLogger:          trafficLogger,
 
 		dnsRouteCache:         common.NewTimeWheelCache[dnsRouteCacheKey, consts.OutboundIndex](1*time.Hour, 5*time.Second, nil),
@@ -1111,7 +1110,9 @@ func ParseFixedDomainTtl(ks []config.KeyableString) (map[string]int, error) {
 		key = common.CanonicalName(strings.TrimSpace(key))
 		ttl, err := strconv.ParseInt(strings.TrimSpace(value), 0, strconv.IntSize)
 		if err != nil {
-			return nil, common.Errf("failed to parse ttl: %v", err)
+			// Name the entry: with several fixed_domain_ttl lines the bare
+			// parser error does not tell the user which one is broken.
+			return nil, common.Errf("failed to parse ttl of entry %q: %v", string(k), err)
 		}
 		m[key] = int(ttl)
 	}
