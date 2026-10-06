@@ -69,10 +69,11 @@ var DnsDesc = Desc{
 	"request": `DNS requests will follow this routing.
 Built-in outbound: asis, reject.
 Available functions: qname, qtype, static.
-Special outbound: race(upstream1, upstream2, ... [via: outbound]) races multiple upstreams concurrently and uses the first response. The optional "via: <outbound>" sends every raced upstream through the given outbound group (each member still picks the best node inside the group), e.g. race(cf4_dns, g4_dns, via: ai).`,
+Race groups are defined in the "upstream" section, e.g. race_dns: 'race(udp://1.1.1.1:53,udp://8.8.8.8:53)', and referenced from routing by tag (-> race_dns). A race group queries its upstreams concurrently and uses the first response. Optionally bind it to an outbound at the reference site: -> race_dns(via: ai). A cached answer comes from the first member holding a fresh entry; expired entries are served stale while every member holding one is refreshed in the background. AAAA queries skip members that cannot proxy IPv6; the tag must be unique, and a single-member group is simply that upstream.`,
 	"response": `DNS responses will follow this routing.
 Built-in outbound: accept, reject.
-Available functions: qname, qtype, ip, upstream`,
+Available functions: qname, qtype, ip, upstream.
+A race group may be the re-resolution target (its members are queried concurrently again). Keep excluding it with !upstream(<tag>) so the re-resolved answer does not match the same rule again.`,
 }
 
 var GroupDesc = Desc{

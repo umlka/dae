@@ -8,7 +8,9 @@ package dns
 import (
 	"fmt"
 	"net/netip"
+	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/consts"
@@ -20,7 +22,12 @@ import (
 )
 
 type ResponseMatcherBuilder struct {
-	upstreamName2Id    map[string]uint8
+	upstreamName2Id map[string]uint8
+	// raceMemberIds maps a race group tag (base or via-bound shadow) to the
+	// upstream indices of its members. Responses are attributed to the member
+	// that answered, never to the group placeholder, so upstream(<tag>) must
+	// expand to these ids to be matchable.
+	raceMemberIds      map[string][]uint8
 	simulatedDomainSet []routing.DomainSet
 	ipSet              []*trie.Trie
 	macSet             []*trie.Trie
@@ -28,11 +35,12 @@ type ResponseMatcherBuilder struct {
 	rules              []responseMatchSet
 }
 
-func NewResponseMatcherBuilder(rules []*config_parser.RoutingRule, upstreamName2Id map[string]uint8, fallback config.FunctionOrString) (b *ResponseMatcherBuilder, err error) {
-	b = &ResponseMatcherBuilder{upstreamName2Id: upstreamName2Id}
+func NewResponseMatcherBuilder(rules []*config_parser.RoutingRule, upstreamName2Id map[string]uint8, fallback config.FunctionOrString, raceMemberIds map[string][]uint8) (b *ResponseMatcherBuilder, err error) {
+	b = &ResponseMatcherBuilder{upstreamName2Id: upstreamName2Id, raceMemberIds: raceMemberIds}
 	rulesBuilder := routing.NewRulesBuilder()
 	rulesBuilder.RegisterFunctionParser(consts.Function_QName, routing.PlainParserFactory(b.addQName))
 	rulesBuilder.RegisterFunctionParser(consts.Function_QType, TypeParserFactory(b.addQType))
+	rulesBuilder.RegisterFunctionParser(consts.Function_RCode, RCodeParserFactory(b.addRCode))
 	rulesBuilder.RegisterFunctionParser(consts.Function_Ip, routing.IpParserFactory(b.addIp))
 	rulesBuilder.RegisterFunctionParser(consts.Function_Upstream, routing.EmptyKeyPlainParserFactory(b.addUpstream))
 	rulesBuilder.RegisterFunctionParser(consts.Function_Mac, routing.MacParserFactory(b.addSourceMac))
@@ -66,6 +74,46 @@ func (b *ResponseMatcherBuilder) upstreamToId(upstream string) (upstreamId const
 		upstreamId = consts.DnsResponseOutboundIndex(_upstreamId)
 	}
 	return upstreamId, nil
+}
+
+// idsForName resolves an upstream reference to every concrete upstream id it
+// denotes: the exact name if defined, plus any via-desugared virtual name
+// "name(<outbound>)" that dns.New registers for race targets. A response rule
+// written with the bare upstream name therefore also covers the virtual entries
+// that race(via:) responses are attributed to. Unknown names keep the
+// "not found" error.
+func (b *ResponseMatcherBuilder) idsForName(name string) (ids []consts.DnsResponseOutboundIndex, err error) {
+	// A race group is never the answering upstream: upstream2Index reports the
+	// member that answered. Expand the tag to its member ids so that
+	// upstream(race_dns) means "answered by any member of the group" - the
+	// group placeholder id itself would never match at query time.
+	if memberIds, isRace := b.raceMemberIds[name]; isRace {
+		for _, id := range memberIds {
+			ids = append(ids, consts.DnsResponseOutboundIndex(id))
+		}
+	} else if id, err := b.upstreamToId(name); err == nil {
+		ids = append(ids, id)
+	}
+	prefix := name + "("
+	for key, id := range b.upstreamName2Id {
+		if key == name || !strings.HasPrefix(key, prefix) || !strings.HasSuffix(key, ")") {
+			continue
+		}
+		// via-bound shadow of the named upstream: a shadow race group expands
+		// to its members, a shadow upstream contributes its own id.
+		if memberIds, isRace := b.raceMemberIds[key]; isRace {
+			for _, memberId := range memberIds {
+				ids = append(ids, consts.DnsResponseOutboundIndex(memberId))
+			}
+			continue
+		}
+		ids = append(ids, consts.DnsResponseOutboundIndex(id))
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("upstream %v not found; please define it in \"dns.upstream\"", strconv.Quote(name))
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids, nil
 }
 
 func (b *ResponseMatcherBuilder) addIp(f *config_parser.Function, cidrs []netip.Prefix, upstream *routing.Outbound) (err error) {
@@ -162,24 +210,28 @@ func (b *ResponseMatcherBuilder) addQName(f *config_parser.Function, key string,
 
 func (b *ResponseMatcherBuilder) addUpstream(f *config_parser.Function, values []string, upstream *routing.Outbound) (err error) {
 	for i, value := range values {
-		upstreamName := consts.OutboundLogicalOr.String()
-		if i == len(values)-1 {
-			upstreamName = upstream.Name
-		}
-		upstreamId, err := b.upstreamToId(upstreamName)
+		ids, err := b.idsForName(value)
 		if err != nil {
 			return err
 		}
-		lastUpstreamId, err := b.upstreamToId(value)
-		if err != nil {
-			return err
+		for j, id := range ids {
+			// Sets of one value chain with OR; only the very last set of the
+			// rule carries its target.
+			upstreamName := consts.OutboundLogicalOr.String()
+			if i == len(values)-1 && j == len(ids)-1 {
+				upstreamName = upstream.Name
+			}
+			upstreamId, err := b.upstreamToId(upstreamName)
+			if err != nil {
+				return err
+			}
+			b.rules = append(b.rules, responseMatchSet{
+				Type:     consts.MatchType_Upstream,
+				Value:    uint16(id),
+				Not:      f.Not,
+				Upstream: uint8(upstreamId),
+			})
 		}
-		b.rules = append(b.rules, responseMatchSet{
-			Type:     consts.MatchType_Upstream,
-			Value:    uint16(lastUpstreamId),
-			Not:      f.Not,
-			Upstream: uint8(upstreamId),
-		})
 	}
 	return nil
 }
@@ -197,6 +249,26 @@ func (b *ResponseMatcherBuilder) addQType(f *config_parser.Function, values []ui
 		b.rules = append(b.rules, responseMatchSet{
 			Type:     consts.MatchType_QType,
 			Value:    uint16(value),
+			Not:      f.Not,
+			Upstream: uint8(upstreamId),
+		})
+	}
+	return nil
+}
+
+func (b *ResponseMatcherBuilder) addRCode(f *config_parser.Function, values []uint16, upstream *routing.Outbound) (err error) {
+	for i, value := range values {
+		upstreamName := consts.OutboundLogicalOr.String()
+		if i == len(values)-1 {
+			upstreamName = upstream.Name
+		}
+		upstreamId, err := b.upstreamToId(upstreamName)
+		if err != nil {
+			return err
+		}
+		b.rules = append(b.rules, responseMatchSet{
+			Type:     consts.MatchType_RCode,
+			Value:    value,
 			Not:      f.Not,
 			Upstream: uint8(upstreamId),
 		})
@@ -302,6 +374,7 @@ func (m *ResponseMatcher) Match(
 	upstream consts.DnsRequestOutboundIndex,
 	srcMac [6]byte,
 	srcIp netip.Addr,
+	rcode uint16,
 ) (upstreamIndex consts.DnsResponseOutboundIndex, err error) {
 	domainMatchBitmap := common.ObtainDomainBitmap()
 	defer common.RecycleDomainBitmap(domainMatchBitmap)
@@ -325,6 +398,10 @@ func (m *ResponseMatcher) Match(
 			}
 		case consts.MatchType_QType:
 			if qType == uint16(match.Value) {
+				goodSubrule = true
+			}
+		case consts.MatchType_RCode:
+			if rcode == uint16(match.Value) {
 				goodSubrule = true
 			}
 		case consts.MatchType_Upstream:

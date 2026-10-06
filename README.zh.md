@@ -36,7 +36,8 @@ dae (daeuniverse/dae)          — 原始项目
 | DNS `ecs` | EDNS0 Client Subnet 控制：全局 `dns.ecs` 默认值（`strip`）+ 节点级 `[ecs: ...]` 标注（`strip`/`<cidr>`/`pass`）——防止客户端网段经代理泄漏与 CDN 区域错配 |
 | DNS `static` | 用户自定义静态 DNS 条目，支持 A、AAAA、TXT 记录，可通过 HTTP API 热更新 |
 | DNS `via` | DNS 查询通过指定 outbound 组发出（如 `proxy_dns(via: ai)`） |
-| DNS `race` | 并发查询多个上游，取最快响应 |
+| DNS `race` | 并发查询多个上游，取最快响应——在 `upstream` 段定义 race 组 |
+| DNS `response` 路由 | 按"应答来自哪个上游 / 应答码 / 应答 IP / qtype / 客户端"匹配 DNS 应答，然后 accept、reject 或换 upstream 重新解析 |
 | DNS `mac` + `sip` | 基于 MAC 地址或源 IP 的客户端级 DNS 过滤 |
 | DNS pool 调优 | 可配置 `udp_pool_size`、`udp_pool_ttl`、`tcp_pool_size`、`tcp_pool_ttl` |
 | 协议 | 扩展支持：Trojan、SSR、SS、SS2022、VLESS、VMess、AnyTLS、Tuic (v5)、Juicity、Hysteria2 |
@@ -282,19 +283,66 @@ qname(keyword:gemini, keyword:openai) -> proxy_dns(via: ai)
 
 ### `dns/race`
 
-并发查询多个上游，使用最先返回的响应：
+在 `upstream` 段定义 race 组——组内上游并发查询，使用最先返回的响应：
 
 ```shell
-qname(geosite:gfw) -> race(proxy_dns, googledns)
+upstream {
+    race_dns: 'race(udp://1.1.1.1:53, udp://8.8.8.8:53)'
+}
 ```
 
-可用尾随的 `via:` 把所有参与竞速的上游绑定到同一个 outbound group——在同一条路径上竞速，但各成员仍会在组内选择最优节点：
+在 routing 里按 tag 引用：
 
 ```shell
-qname(geosite:gfw) -> race(proxy_dns, googledns, via: ai)
+qname(geosite:gfw) -> race_dns
 ```
 
-`via:` 写在参数列表的任意位置均可。内部会将每个成员脱糖为虚拟上游 `proxy_dns(ai)` / `googledns(ai)`——与单独的 `proxy_dns(via: ai)` 规则共用同一个上游实例和缓存身份。
+成员既可以是裸 link，也可以是其它 upstream 的 tag。组还可在引用处绑定 outbound group——所有成员经由该组出站，但仍各自在组内选择最优节点：
+
+```shell
+qname(geosite:gfw) -> race_dns(via: ai)
+```
+
+缓存应答按配置顺序挑选：第一个持有新鲜条目的成员直接应答，不发起拨号；否则以第一个过期条目作陈旧
+应答兜底，同时所有持过期条目的成员各自后台刷新（每成员一条独立 flight），因此刷新同样是对整组 race。
+
+`AAAA` 查询会跳过无法代理 IPv6 的成员，仅当所有成员都不能代理时才返回空应答。race 只覆盖转发阶段：
+响应规则作用于胜者的应答，若规则再把查询交回该组，则对其成员开启新一轮。tag 必须唯一；只有一个
+成员的组不成其为组——加载时 tag 直接绑定到该 upstream，与直接声明该 upstream 完全等价。
+
+### `dns/response`
+
+`response` 块匹配 DNS **应答**——按"应答来自哪个 upstream / 应答码 / 应答中的 IP / qtype / 客户端"——然后
+accept、reject，或换一个 upstream 重新解析。典型用途是防污染：国内上游对国外域名答出了非 CN IP，
+就换另一个 upstream 重查——目标也可以是 race 组，此时其成员会再次并发查询：
+
+```shell
+response {
+  rcode(nxdomain) -> accept   # 不存在的名字：直接接受，不重查
+  !upstream(race_dns) && !ip(geoip:private) && !ip(geoip:cn) -> race_dns
+  fallback: accept
+}
+```
+
+要点：
+
+- `rcode(...)` 匹配应答码：`noerror`、`formerr`、`servfail`、`nxdomain`、`notimp`、`refused`、...
+  （大小写不敏感）或数字（`rcode(3)`）。NXDOMAIN 没有任何应答 IP，`ip(...)` 永远匹配不上它——
+  没有 rcode 规则时，该上游的每个 NXDOMAIN 都会触发一轮重解析。代价：被上游以 NXDOMAIN
+  形式污染的域名不会再被重解析找回。
+- `upstream(...)` 匹配"应答来自哪个 upstream"。裸名同时覆盖 `via:` 绑定出的影子成员：
+  经 `race_dns(via: ai)` 应答的响应会被 `upstream(cf_dns)`、`upstream('cf_dns(ai)')`
+  或组名整体（`upstream(race_dns)`）命中——**组名会展开为该组的所有成员**（组本身从不应答，
+  应答总是归属到具体成员）。
+- 必须用 `!upstream(...)` 排除重解析目标本身：否则重解析得到的应答会再次命中同一条规则，
+  耗尽查找深度上限（3），查询变成 SERVFAIL。
+- `!ip(geoip:private)` 把局域网/静态条目应答排除出重解析：它们本就是有意的应答，公网上游只会
+  用 NXDOMAIN 覆盖它们。
+- race 组**可以**作为重解析的目标（其成员再次并发查询）；查找深度上界会跨越 race 展开，因此若不排除该组成员，规则会在 depth 上限收敛为 SERVFAIL 而不是无限递归。
+- 重解析得到的应答与普通应答一样写入缓存，后续相同查询直接命中缓存，只重跑（廉价的）response 匹配。
+- 支持 `!` 取反、多值（`upstream(a, b)` = a 或 b）、以及与其它匹配器（`qtype`、`rcode`、`ip`、
+  `mac`、`sip`、`qname`）的 `&&` 组合。
+- 未命中的应答按 `fallback:` 处理（`accept` 或 `reject`）。
 
 ### `dns/mac` + `dns/sip`
 

@@ -36,7 +36,8 @@ dae (daeuniverse/dae)          — Original project
 | DNS `ecs` | EDNS0 Client Subnet control: global `dns.ecs` default (`strip`) plus per-dialer `[ecs: ...]` annotation (`strip`/`<cidr>`/`pass`) — stops client-subnet leaks and CDN region mismatch through proxies |
 | DNS `static` | User-defined static DNS entries with A, AAAA, TXT records — hot-reloadable via HTTP API |
 | DNS `via` | Route DNS queries through a specific outbound group (e.g. `proxy_dns(via: ai)`) |
-| DNS `race` | Query multiple upstreams concurrently, first response wins |
+| DNS `race` | Query multiple upstreams concurrently, first response wins — define race groups in the `upstream` section |
+| DNS `response` routing | Match DNS responses by answering upstream / response code / answer IPs / qtype / client and accept, reject, or re-resolve via another upstream |
 | DNS `mac` + `sip` | Per-client DNS filtering by MAC address or source IP |
 | DNS pool tuning | Configurable `udp_pool_size`, `udp_pool_ttl`, `tcp_pool_size`, `tcp_pool_ttl` |
 | Protocols | Extended support: Trojan, SSR, SS, SS2022, VLESS, VMess, AnyTLS, Tuic (v5), Juicity, Hysteria2 |
@@ -282,23 +283,86 @@ qname(keyword:gemini, keyword:openai) -> proxy_dns(via: ai)
 
 ### `dns/race`
 
-Query multiple upstreams concurrently and use the first response:
+Define a race group in the `upstream` section — it queries its upstreams
+concurrently and uses the first response:
 
 ```shell
-qname(geosite:gfw) -> race(proxy_dns, googledns)
+upstream {
+    race_dns: 'race(udp://1.1.1.1:53, udp://8.8.8.8:53)'
+}
 ```
 
-A trailing `via:` binds every raced upstream to one outbound group — race them
-over the same path while each member still picks the best node inside it:
+Reference it from routing by tag:
 
 ```shell
-qname(geosite:gfw) -> race(proxy_dns, googledns, via: ai)
+qname(geosite:gfw) -> race_dns
 ```
 
-`via:` may appear anywhere in the argument list. Internally each member is
-desugared to its virtual upstream `proxy_dns(ai)` / `googledns(ai)` — the same
-instance a standalone `proxy_dns(via: ai)` rule uses — so both forms share one
-upstream entry and one cache identity.
+Members may be raw links or the tags of other upstreams. The group can also be
+bound to an outbound group at the reference site — every member is then dialed
+through that group while still picking the best node inside it:
+
+```shell
+qname(geosite:gfw) -> race_dns(via: ai)
+```
+
+Cached answers are picked in config order: the first member with a fresh entry
+answers without dialing. Otherwise the first expired entry is served as a stale
+answer while every member holding one is refreshed in the background — one
+flight per member, so that refresh races the group as well.
+
+`AAAA` queries skip members whose dialer cannot proxy IPv6 and are answered
+empty only when no member can. The race covers the forwarding step: response
+rules run on the winning answer, and a rule that sends the query back to the
+group starts another round against its members. Tags must be unique, and a
+group with a single member is not a group at all: at load time its tag binds
+straight to that upstream, exactly as if it had been declared directly.
+
+### `dns/response`
+
+The `response` block matches a DNS **response** — by the upstream that answered
+it, the response code, the IPs in the answer, the qtype, or the client — and
+then accepts it, rejects it, or re-resolves the query through another upstream.
+The canonical use is anti-poisoning: if a domestic upstream answers a non-CN IP
+for a foreign name, re-query through another upstream — a race group is allowed
+as the target, in which case its members are queried concurrently again:
+
+```shell
+response {
+  rcode(nxdomain) -> accept   # names that don't exist: accept, don't re-resolve
+  !upstream(race_dns) && !ip(geoip:private) && !ip(geoip:cn) -> race_dns
+  fallback: accept
+}
+```
+
+Notes:
+
+- `rcode(...)` matches the response code: `noerror`, `formerr`, `servfail`,
+  `nxdomain`, `notimp`, `refused`, ... (case-insensitive) or the number
+  (`rcode(3)`). An NXDOMAIN carries no answer IPs, so `ip(...)` never matches
+  it — without an rcode rule, every NXDOMAIN from that upstream triggers a
+  re-resolution round-trip. Trade-off: a name its upstream answers with
+  NXDOMAIN is no longer recovered by the re-resolution.
+- `upstream(<race tag>)` matches a response answered by **any member** of that
+  race group (the group itself never answers; responses are attributed to the
+  member that did). A race group works as the re-resolution target too; the
+  lookup-depth bound spans the expansion, so a rule that does not exclude the
+  group's members converges to SERVFAIL instead of looping forever.
+- `upstream(...)` matches the upstream the response came from. A bare name also
+  covers the `via:`-bound shadow members: a response answered through
+  `race_dns(via: ai)` matches `upstream(cf_dns)`, `upstream('cf_dns(ai)')`, or
+  the group as a whole (`upstream(race_dns)`).
+- Excluding the re-resolution target with `!upstream(...)` is required: it stops
+  the re-resolved answer from matching the same rule again and exhausting the
+  lookup-depth bound (3), which would turn the query into SERVFAIL.
+- `!ip(geoip:private)` keeps LAN/static answers out of the re-resolution: they
+  are intentional answers, and public upstreams would only replace them with
+  NXDOMAIN.
+- Re-resolved answers are cached like ordinary ones, so subsequent queries hit
+  the cache and only re-run the (cheap) response matching.
+- `!` negation, multiple values (`upstream(a, b)` = a OR b), and `&&` chaining
+  with the other matchers (`qtype`, `rcode`, `ip`, `mac`, `sip`, `qname`) all work.
+- Everything else falls back to `fallback:` (`accept` or `reject`).
 
 ### `dns/mac` + `dns/sip`
 

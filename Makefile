@@ -132,3 +132,22 @@ ebpf-test: submodule clean-ebpf
     go test -v ./control/kern/tests/...
 
 ## End Ebpf
+
+# Out of scope: generated code (config_dist, pkg/geodata) and the eBPF side.
+# control and trace reference the bpf2go-generated types (bpfObjects and
+# friends) that `make ebpf` produces and that are deliberately not committed,
+# so a clean checkout -- CI included -- cannot compile them; linting them needs
+# a dae_stub_ebpf-style build tag first (kdae's approach). control/kern/tests
+# needs the same objects. (control and trace were verified clean with the
+# generated objects present: go vet + staticcheck at 2026.2.1.)
+LINT_GO_PKGS := $(shell go list ./... 2>/dev/null | grep -vE '^github.com/daeuniverse/dae/control|^github.com/daeuniverse/dae/trace|config_dist|pkg/geodata')
+STATICCHECK_VERSION := 2026.2.1
+
+# Go lint gate: gofmt, go vet and staticcheck (see staticcheck.conf for the
+# deliberate exclusions). Out of scope: generated code (config_dist,
+# pkg/geodata) and control/kern/tests, whose test binary needs the eBPF
+# objects from `make ebpf`.
+lint-go:
+	@files="$$(gofmt -l .)"; if [ -n "$$files" ]; then echo "gofmt needed on:"; echo "$$files"; exit 1; fi
+	go vet $(LINT_GO_PKGS)
+	go run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION) $(LINT_GO_PKGS)

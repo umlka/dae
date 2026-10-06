@@ -37,6 +37,9 @@ const (
 	upstreamScheme_H3_Alias      UpstreamScheme = "http3"
 	UpstreamScheme_H3            UpstreamScheme = "h3"
 	UpstreamScheme_Static        UpstreamScheme = "static"
+	// UpstreamScheme_Race marks the synthetic upstream standing for a race
+	// group. It never dials: callers expand its Members instead.
+	UpstreamScheme_Race UpstreamScheme = "race"
 )
 
 func ParseRawUpstream(raw *url.URL) (scheme UpstreamScheme, hostname string, port uint16, path string, err error) {
@@ -91,6 +94,17 @@ type Upstream struct {
 	netutils.Ip46
 	IsAsIs   bool
 	Outbound consts.OutboundIndex // 0xFF = unspecified (use traffic routing)
+	// RaceGroup is non-nil only on the synthetic upstream standing for a race
+	// group, and carries that group's members. It sits behind a pointer on
+	// purpose: Upstream doubles as a forwarder-cache map key, so it must stay
+	// comparable, and only dialable upstreams ever reach that cache.
+	RaceGroup *RaceGroup
+}
+
+// RaceGroup carries the members of a race group.
+type RaceGroup struct {
+	Tag     string
+	Members []*Upstream
 }
 
 func NewUpstream(ctx context.Context, upstream *url.URL, resolverNetwork string) (up *Upstream, err error) {
@@ -148,6 +162,12 @@ func (u *Upstream) IsNetworkSupported(network *common.NetworkType) bool {
 		return false
 	}
 	return true
+}
+
+// IsRaceGroup reports whether u is the synthetic upstream standing for a race
+// group. It is never dialed: callers expand Members instead.
+func (u *Upstream) IsRaceGroup() bool {
+	return u != nil && u.Scheme == UpstreamScheme_Race
 }
 
 func (u *Upstream) String() string {
