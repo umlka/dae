@@ -1387,6 +1387,11 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 	}
 
 	c.bpfMapJanitor.Start(c.ctx)
+	// Datapath events (bounded-map write failures) are pushed over the event
+	// ring buffer; this control plane reacts to them while it is serving. The
+	// reader itself follows the bpf state, so a hot reload keeps it alive.
+	setDatapathEventSink(&datapathEventSink{owner: c, janitor: &c.bpfMapJanitor})
+	startDatapathEventConsumer(c.core.bpf)
 
 	<-c.ctx.Done()
 	return nil
@@ -1556,19 +1561,18 @@ func (c *ControlPlane) udpRoutine(param *udpRoutineParam) {
 		var routingResult *bpfRoutingResult
 		var ok bool
 		if routingResult, ok = c.dnsRoutingResultCache.Get(src.Addr()); !ok {
-			var err error
 			// Don't use ObtainBpfRoutingResult() because it would be saved in cache.
-			routingResult = new(bpfRoutingResult)
-			// DNS routing is per-IP, not per-sport.
-			dnsSrc := netip.AddrPortFrom(src.Addr(), 0)
-			if err = c.core.RetrieveUDPRoutingResult(dnsSrc, dst, routingResult); err != nil {
-				if log.IsLevelEnabled(log.ErrorLevel) {
-					log.Errorf("%+v", common.Wrap(err, "Failed to retrieve udp 53 routing result, src: %v", src))
-				}
-				pool.PutBuffer(data)
-				return
+			// A missing routing result fails open for DNS: see
+			// resolveUdpDnsRoutingResult. Dropping here used to kill every DNS
+			// query — static/local entries included — whenever the dataplane
+			// failed to record a flow.
+			var cacheable bool
+			routingResult, cacheable = resolveUdpDnsRoutingResult(c.core.RetrieveUDPRoutingResult, src, dst)
+			if !cacheable {
+				logDnsRoutingMissThrottled(src, dst)
+			} else {
+				c.dnsRoutingResultCache.Save(src.Addr(), routingResult)
 			}
-			c.dnsRoutingResultCache.Save(src.Addr(), routingResult)
 		}
 		if routingResult.Must == 0 {
 			dq := ObtainDnsRequest(src, dst, routingResult, false)
@@ -2332,6 +2336,9 @@ func (c *ControlPlane) Close() (err error) {
 
 	// Stop janitor before cancel (so BPF maps are still valid during cleanup).
 	c.bpfMapJanitor.Stop()
+	// Stop reacting to datapath events; a successor installed by a hot reload
+	// keeps its own registration.
+	clearDatapathEventSink(c)
 
 	// Invoke defer funcs in reverse order.
 	for _, v := range slices.Backward(c.deferFuncs) {

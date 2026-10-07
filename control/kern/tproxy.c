@@ -49,7 +49,11 @@
 #endif
 #define MAX_LPM_SIZE 2048000
 #define MAX_LPM_NUM (MAX_MATCH_SET_LEN + 8)
+// Overridable so a test build can shrink the map and exercise the
+// write-failure/event/janitor path without patching the source.
+#ifndef MAX_DST_MAPPING_NUM
 #define MAX_DST_MAPPING_NUM 65536
+#endif
 #define MAX_COOKIE_PID_PNAME_MAPPING_NUM 65536
 #define MAX_DOMAIN_ROUTING_NUM 65536
 #define MAX_ARG_LEN 128
@@ -133,7 +137,13 @@ struct {
 	__type(value, struct redirect_entry);
 	__uint(max_entries, 65536);
 } redirect_track SEC(".maps");
-// Memory is allocated on demand (BPF_F_NO_PREALLOC).
+// BPF_F_NO_PREALLOC allocates entries on demand, but the kernel still
+// charges the bucket array at load time: max_entries * 16 B, i.e. 1 MiB
+// at the 65536 slots below, whatever the live entry count is (measured on
+// kernel 6.17). The same floor applies to routing_tuples_map,
+// domain_routing_map, domain_bump_map and cookie_pid_map, so size each one
+// to its measured live count with wide headroom and treat the janitor's
+// capacity warning as the signal to raise it again.
 
 
 struct routing_result {
@@ -206,7 +216,119 @@ struct {
 	__uint(max_entries, MAX_DST_MAPPING_NUM);
 	__uint(pinning, LIBBPF_PIN_NONE);
 } routing_tuples_map SEC(".maps");
-// Memory is allocated on demand (BPF_F_NO_PREALLOC).
+// BPF_F_NO_PREALLOC allocates entries on demand, but the kernel still
+// charges the bucket array at load time: max_entries * 16 B, i.e. 1 MiB
+// at the 65536 slots below, whatever the live entry count is (measured on
+// kernel 6.17). The same floor applies to routing_tuples_map,
+// domain_routing_map, domain_bump_map and cookie_pid_map, so size each one
+// to its measured live count with wide headroom and treat the janitor's
+// capacity warning as the signal to raise it again.
+
+// ---------------------------------------------------------------------------
+// Datapath events: eBPF -> control plane proactive notification.
+//
+// A bounded datapath structure that rejects a write is a condition the control
+// plane must know about immediately (and, for the maps it can, relieve). The
+// ring buffer carries that notification; the control plane consumes it and
+// decides whether to sweep, throttle or just report.
+//
+// Two rules keep this safe under a flood:
+//   1. the per-slot exact counter is incremented before any throttling, so the
+//      reported volume is never understated by a lost event;
+//   2. the event itself is throttled to one per (type, site) per second,
+//      because the ring buffer is a bounded shared resource and a flood must
+//      not be able to starve the other event types out of it.
+// ---------------------------------------------------------------------------
+
+// Event types. Append-only: the Go decoder (control/datapath_events.go) maps
+// these numbers to names.
+enum dae_event_type {
+	DAE_EVENT_UNSPECIFIED = 0,
+	DAE_EVENT_ROUTING_TUPLES_WRITE_FAILED = 1,
+	DAE_EVENT_REDIRECT_TRACK_WRITE_FAILED = 2,
+	DAE_EVENT_COOKIE_PID_WRITE_FAILED = 3,
+};
+
+#define EVENT_SLOT_TYPES 8
+#define EVENT_SLOT_SITES 8
+#define EVENT_SLOT_COUNT (EVENT_SLOT_TYPES * EVENT_SLOT_SITES)
+#define EVENT_SLOT_KEY(type, site) \
+	(((type) % EVENT_SLOT_TYPES) * EVENT_SLOT_SITES + ((site) % EVENT_SLOT_SITES))
+#define EVENT_EMIT_INTERVAL_NS 1000000000ULL /* 1s per (type, site) */
+
+struct dae_event {
+	__u64 timestamp_ns;
+	__u32 type;
+	__u32 site;
+	__s32 err;
+	__u32 l4proto;
+};
+
+struct dae_event_slot {
+	__u64 count;      /* exact failure count, never throttled */
+	__u64 last_emit_ns;
+	__s32 last_err;
+	__u32 last_l4proto;
+};
+
+/* The Go decoder reads these fields by offset; any change here must be mirrored
+ * in control/datapath_events.go (and its layout test). */
+typedef char dae_event_layout_check[(sizeof(struct dae_event) == 24) ? 1 : -1];
+typedef char dae_event_slot_layout_check[(sizeof(struct dae_event_slot) == 24) ? 1 : -1];
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 1 << 18); /* 256 KiB of throttled diagnostics */
+} event_ringbuf SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, struct dae_event_slot);
+	__uint(max_entries, EVENT_SLOT_COUNT);
+} event_slots SEC(".maps");
+
+static __always_inline void note_dae_event(__u32 type, __u32 site, __s32 err,
+					   __u32 l4proto)
+{
+	__u32 key = EVENT_SLOT_KEY(type, site);
+	struct dae_event_slot *slot = bpf_map_lookup_elem(&event_slots, &key);
+	struct dae_event *ev;
+	__u64 now;
+
+	if (!slot)
+		return;
+
+	__sync_fetch_and_add(&slot->count, 1);
+	slot->last_err = err;
+	slot->last_l4proto = l4proto;
+
+	now = bpf_ktime_get_ns();
+	if (now - slot->last_emit_ns < EVENT_EMIT_INTERVAL_NS)
+		return;
+	slot->last_emit_ns = now;
+
+	ev = bpf_ringbuf_reserve(&event_ringbuf, sizeof(*ev), 0);
+	if (!ev)
+		return; /* ring buffer full: lose the notification, keep the count */
+	ev->timestamp_ns = now;
+	ev->type = type;
+	ev->site = site;
+	ev->err = err;
+	ev->l4proto = l4proto;
+	bpf_ringbuf_submit(ev, 0);
+}
+
+#ifdef __DEBUG_ROUTING
+static __always_inline void debug_note_dae_event(__u32 type, __u32 site,
+						 __s32 err)
+{
+	bpf_printk("dae event: type=%d site=%d err=%d", (int)type, (int)site,
+		   (int)err);
+}
+#else
+#define debug_note_dae_event(type, site, err) ((void)0)
+#endif
 
 // Array of LPM tries:
 struct lpm_key {
@@ -325,7 +447,13 @@ struct {
 	/// NOTICE: No persistence.
 	// __uint(pinning, LIBBPF_PIN_BY_NAME);
 } domain_routing_map SEC(".maps");
-// 13.63 MB
+// BPF_F_NO_PREALLOC allocates entries on demand, but the kernel still
+// charges the bucket array at load time: max_entries * 16 B, i.e. 1 MiB
+// at the 65536 slots below, whatever the live entry count is (measured on
+// kernel 6.17). The same floor applies to routing_tuples_map,
+// domain_routing_map, domain_bump_map and cookie_pid_map, so size each one
+// to its measured live count with wide headroom and treat the janitor's
+// capacity warning as the signal to raise it again.
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -336,7 +464,13 @@ struct {
 	/// NOTICE: No persistence.
 	// __uint(pinning, LIBBPF_PIN_BY_NAME);
 } domain_bump_map SEC(".maps");
-// 13.63 MB
+// BPF_F_NO_PREALLOC allocates entries on demand, but the kernel still
+// charges the bucket array at load time: max_entries * 16 B, i.e. 1 MiB
+// at the 65536 slots below, whatever the live entry count is (measured on
+// kernel 6.17). The same floor applies to routing_tuples_map,
+// domain_routing_map, domain_bump_map and cookie_pid_map, so size each one
+// to its measured live count with wide headroom and treat the janitor's
+// capacity warning as the signal to raise it again.
 
 
 struct pid_pname {
@@ -354,7 +488,13 @@ struct {
 	/// NOTICE: No persistence.
 	__uint(pinning, LIBBPF_PIN_NONE);
 } cookie_pid_map SEC(".maps");
-// Memory is allocated on demand (BPF_F_NO_PREALLOC).
+// BPF_F_NO_PREALLOC allocates entries on demand, but the kernel still
+// charges the bucket array at load time: max_entries * 16 B, i.e. 1 MiB
+// at the 65536 slots below, whatever the live entry count is (measured on
+// kernel 6.17). The same floor applies to routing_tuples_map,
+// domain_routing_map, domain_bump_map and cookie_pid_map, so size each one
+// to its measured live count with wide headroom and treat the janitor's
+// capacity warning as the signal to raise it again.
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -1524,7 +1664,10 @@ publish_redirect_track_for_packet(struct __sk_buff *skb, __u32 link_h_len,
 	map_ret = bpf_map_update_elem(&redirect_track, &redirect_tuple,
 				      &redirect_entry, BPF_ANY);
 	if (map_ret) {
-		bpf_printk("redirect_track update failed: %d", (int)map_ret);
+		note_dae_event(DAE_EVENT_REDIRECT_TRACK_WRITE_FAILED, 0,
+			       (__s32)map_ret, 0);
+		debug_note_dae_event(DAE_EVENT_REDIRECT_TRACK_WRITE_FAILED, 0,
+				     (__s32)map_ret);
 		return (int)map_ret;
 	}
 	return 0;
@@ -1792,7 +1935,20 @@ static __always_inline int do_tproxy(struct __sk_buff *skb, bool is_wan, u32 lin
 	routing_result->last_seen_ns = bpf_ktime_get_ns();
 
 	if (l4proto == IPPROTO_UDP) {
-		bpf_map_update_elem(&routing_tuples_map, &udp_tuples_key, routing_result, BPF_ANY);
+		// Unchecked updates used to fail silently here; the control plane then
+		// looked up a key that was never written. Keep the forwarding path
+		// untouched (the packet still goes to the control plane) and only
+		// report the failure.
+		long update_ret = bpf_map_update_elem(&routing_tuples_map,
+						      &udp_tuples_key,
+						      routing_result, BPF_ANY);
+
+		if (update_ret) {
+			note_dae_event(DAE_EVENT_ROUTING_TUPLES_WRITE_FAILED, 1,
+				       (__s32)update_ret, l4proto);
+			debug_note_dae_event(DAE_EVENT_ROUTING_TUPLES_WRITE_FAILED, 1,
+					     (__s32)update_ret);
+		}
 	}
 
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
@@ -1827,9 +1983,16 @@ static __always_inline int do_tproxy(struct __sk_buff *skb, bool is_wan, u32 lin
 #endif
 		if (l4proto == IPPROTO_TCP && routing_result->mark != 0) {
 			// Marked TCP direct route, must be saved to map for subsequent packets.
-			if (bpf_map_update_elem(&routing_tuples_map, &tuples.five,
-						routing_result, BPF_ANY)) {
-				bpf_printk("shot save direct routing result: %d", s64_ret);
+			long update_ret = bpf_map_update_elem(&routing_tuples_map,
+							      &tuples.five,
+							      routing_result,
+							      BPF_ANY);
+
+			if (update_ret) {
+				note_dae_event(DAE_EVENT_ROUTING_TUPLES_WRITE_FAILED, 2,
+					       (__s32)update_ret, l4proto);
+				debug_note_dae_event(DAE_EVENT_ROUTING_TUPLES_WRITE_FAILED,
+						     2, (__s32)update_ret);
 				return TC_ACT_SHOT;
 			}
 		}
@@ -1854,9 +2017,15 @@ static __always_inline int do_tproxy(struct __sk_buff *skb, bool is_wan, u32 lin
 
 	// TCP proxy traffic should be saved.
 	if (l4proto == IPPROTO_TCP) {
-		if (bpf_map_update_elem(&routing_tuples_map, &tuples.five,
-					routing_result, BPF_ANY)) {
-			bpf_printk("shot save routing result: %d", s64_ret);
+		long update_ret = bpf_map_update_elem(&routing_tuples_map,
+						      &tuples.five, routing_result,
+						      BPF_ANY);
+
+		if (update_ret) {
+			note_dae_event(DAE_EVENT_ROUTING_TUPLES_WRITE_FAILED, 3,
+				       (__s32)update_ret, l4proto);
+			debug_note_dae_event(DAE_EVENT_ROUTING_TUPLES_WRITE_FAILED, 3,
+					     (__s32)update_ret);
 			return TC_ACT_SHOT;
 		}
 	}
@@ -2267,7 +2436,11 @@ static __always_inline int _update_map_elem_by_cookie(const __u64 cookie,
 	// Update map.
 	ret = bpf_map_update_elem(&cookie_pid_map, &cookie, val, BPF_ANY);
 	if (unlikely(ret)) {
-		// bpf_printk("setup_mapping_from_sk: failed update map: %d", ret);
+		// A full cookie_pid_map silently degrades pname-based routing; make
+		// the failure visible instead of only returning it.
+		note_dae_event(DAE_EVENT_COOKIE_PID_WRITE_FAILED, 1, (__s32)ret, 0);
+		debug_note_dae_event(DAE_EVENT_COOKIE_PID_WRITE_FAILED, 1,
+				     (__s32)ret);
 		return ret;
 	}
 
@@ -2288,7 +2461,12 @@ static __always_inline int update_map_elem_by_cookie(const __u64 cookie)
 		// Fallback to only write pid to avoid loop due to packets sent by dae.
 		val.last_seen_ns = bpf_ktime_get_ns();
 		val.pid = bpf_get_current_pid_tgid() >> 32;
-		bpf_map_update_elem(&cookie_pid_map, &cookie, &val, BPF_ANY);
+		if (bpf_map_update_elem(&cookie_pid_map, &cookie, &val, BPF_ANY)) {
+			note_dae_event(DAE_EVENT_COOKIE_PID_WRITE_FAILED, 2,
+				       -1, 0);
+			debug_note_dae_event(DAE_EVENT_COOKIE_PID_WRITE_FAILED, 2,
+					     -1);
+		}
 		return ret;
 	}
 	return 0;
