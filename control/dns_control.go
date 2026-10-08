@@ -747,7 +747,12 @@ func (c *DnsController) forwardOne(
 	dnsResp *dnsResponseData,
 ) error {
 	if err := c.dialSend(data, upstream, dialArg, queryInfo, dnsResp); err != nil {
-		if err = c.forwardError(err, dialArg, queryInfo, dnsResp); err != nil {
+		if err, demote := c.forwardError(err, dialArg, queryInfo, dnsResp); err != nil {
+			// Nothing can absorb this failure: both callers treat it as fatal.
+			if demote {
+				dialArg.Dialer.ReportUnavailable()
+			}
+			common.Metrics.ErrorCount.With4(dnsDialErrorLabels(dialArg)).Inc()
 			return err
 		}
 	}
@@ -768,6 +773,10 @@ type dnsForwardResult struct {
 	candidate *dnsForwardCandidate
 	win       bool
 	err       error
+	// demote is the forwarding-failure policy's verdict on marking this
+	// member's dialer unavailable. The race loop acts on it only for the
+	// failure it reports: a loser a sibling covered must not move the dialer.
+	demote bool
 }
 
 // forwardDNSRaceGroup is the request phase for a race group: every member is a
@@ -896,8 +905,9 @@ func (c *DnsController) forwardDNSRaceGroup(
 			defer pool.PutBuffer(dataCopy)
 			localResp := dnsResponseDataPool.Get().(*dnsResponseData)
 			err := c.dialSend(dataCopy, cand.upstream, &cand.dialArg, queryInfo, localResp)
+			var demote bool
 			if err != nil {
-				err = c.forwardError(err, &cand.dialArg, queryInfo, localResp)
+				err, demote = c.forwardError(err, &cand.dialArg, queryInfo, localResp)
 			}
 			win := err == nil && winnerFlag.CompareAndSwap(false, true)
 			if win {
@@ -908,21 +918,48 @@ func (c *DnsController) forwardDNSRaceGroup(
 			}
 			*localResp = dnsResponseData{}
 			dnsResponseDataPool.Put(localResp)
-			results <- dnsForwardResult{candidate: cand, win: win, err: err}
+			results <- dnsForwardResult{candidate: cand, win: win, err: err, demote: demote}
 		}(cand, dataCopy)
 	}
 	var firstErr error
+	var firstFailedDialArg *dialArgument
+	var firstFailedDemote bool
 	for range len(usable) {
 		res := <-results
 		if res.win {
 			return res.candidate.upstream, nil
 		}
-		if firstErr == nil && res.err != nil {
-			firstErr = res.err
+		if res.err != nil {
+			// This member did not answer. If a sibling does, the failure is
+			// absorbed: the client never sees it, it is not counted and nothing
+			// is logged, so mirror the detail at debug level -- also the only
+			// place that explains why the member may have been demoted. If
+			// nobody answers, the first one here is the failure the returned
+			// error reports (and the query's single count).
+			if log.IsLevelEnabled(log.DebugLevel) {
+				log.WithFields(log.Fields{
+					"upstream": res.candidate.upstream.String(),
+					"qname":    queryInfo.qname,
+					"qtype":    queryInfo.qtype,
+				}).WithError(res.err).Debugln("DNS race candidate failed; another member answered")
+			}
+			if firstErr == nil {
+				firstErr = res.err
+				firstFailedDialArg = &res.candidate.dialArg
+				firstFailedDemote = res.demote
+			}
 		}
 	}
-	if firstErr == nil {
-		firstErr = common.Errf("no race member produced an answer")
+	// No winner means error. The switch above guarantees at least one usable
+	// member, so reaching here means every result failed.
+	if firstFailedDialArg != nil {
+		common.Metrics.ErrorCount.With4(dnsDialErrorLabels(firstFailedDialArg)).Inc()
+		// Only the failure actually reported moves its dialer: a member a
+		// sibling covered is left alone, and the others keep their own chances
+		// (or the connectivity checker) to be found unavailable.
+		if firstFailedDemote {
+			firstFailedDialArg.Dialer.ReportUnavailable()
+		}
 	}
 	return nil, fmt.Errorf("all %d race upstreams failed: %w", len(usable), firstErr)
 }
@@ -974,11 +1011,27 @@ func (c *DnsController) refreshDNSInBackground(data []byte, queryInfo queryInfo,
 	}(c, p, key)
 }
 
+// dnsDialErrorLabels builds the metric labels of a counted DNS forwarding
+// failure (outbound, subscription tag, dialer, network).
+func dnsDialErrorLabels(dialArg *dialArgument) [4]string {
+	return [4]string{
+		dialArg.Outbound.Name,
+		dialArg.Dialer.Property.SubscriptionTag,
+		dialArg.Dialer.Name,
+		dialArg.networkType.String(),
+	}
+}
+
 // forwardError applies the forwarding-failure policy: wrap the error with its
-// routing context, count it, and mark the dialer unavailable when the failure
-// says something about the route. It returns nil when the error came with a
-// usable response, in which case the caller carries on with that response.
-func (c *DnsController) forwardError(err error, dialArg *dialArgument, queryInfo queryInfo, dnsResp *dnsResponseData) error {
+// routing context and report whether the failure also says something about the
+// route (in which case the dialer should be marked unavailable). It returns a
+// nil error when the failure came with a usable response, in which case the
+// caller carries on with that response.
+//
+// Marking the dialer unavailable is left to the caller: only it knows whether a
+// race sibling absorbed the failure, and an absorbed failure must not move the
+// dialer away.
+func (c *DnsController) forwardError(err error, dialArg *dialArgument, queryInfo queryInfo, dnsResp *dnsResponseData) (error, bool) {
 	isNetError, isClosed, isTimeout, isTemporary := GetNetErrorInfo(err)
 	if !isNetError || isClosed || !dnsResponse(dnsResp.respData) || (!isTimeout && dialArg.Dialer.NeedAliveState()) {
 		err = common.
@@ -991,22 +1044,18 @@ func (c *DnsController) forwardError(err error, dialArg *dialArgument, queryInfo
 			With("Outbound", dialArg.Outbound.Name).
 			With("Dialer", dialArg.Dialer.Name).
 			Wrapf(err, "DNS dialSend error")
-		labels := [...]string{
-			dialArg.Outbound.Name,
-			dialArg.Dialer.Property.SubscriptionTag,
-			dialArg.Dialer.Name,
-			dialArg.networkType.String(),
-		}
-		common.Metrics.ErrorCount.With4(labels).Inc()
+		// Counting is deliberately NOT done here: this function cannot know
+		// whether a race sibling will absorb the failure. The callers that do
+		// know count it -- forwardOne for a fatal single-upstream failure, and
+		// the race loop only when no member answered at all.
 
 		if !isNetError || isClosed || !dnsResponse(dnsResp.respData) {
-			return err
+			return err, false
 		}
 		// !isTimeout && dialArgument.Dialer.NeedAliveState()
-		dialArg.Dialer.ReportUnavailable()
-		return err
+		return err, true
 	}
-	return nil
+	return nil, false
 }
 
 // ResolveForVerification triggers a real DNS query through DAE's full DNS pipeline
